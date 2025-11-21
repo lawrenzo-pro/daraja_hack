@@ -64,6 +64,18 @@ const generateTokenInternal = async () => {
     const response = await axios.get(url, { headers: { Authorization: `Basic ${auth}` } });
     return response.data.access_token;
 };
+// --- MIDDLEWARE ---
+const authenticate = (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (!token) return res.status(401).json({ error: "Access Denied" });
+
+    jwt.verify(token, SECRET_KEY, (err, user) => {
+        if (err) return res.status(403).json({ error: "Invalid Token" });
+        req.user = user;
+        next();
+    });
+};
 
 // 2. Standalone STK Push Function
 const triggerStkPush = async (phone, amount, accountRef = "AutoTopUp") => {
