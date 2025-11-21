@@ -131,6 +131,76 @@ const getTimestamp = () => {
     return date.toISOString().replace(/[^0-9]/g, '').slice(0, 14);
 };
 
+const mqttClient = mqtt.connect('mqtt://localhost', {
+    username: 'laurie',
+    password: 'KeyM@nee17',
+    clientId: 'matatu_backend_server_' + Math.random().toString(16).substr(2, 8)
+});
+
+// 2. On Connect
+mqttClient.on('connect', () => {
+    console.log("✅ Connected to MQTT Broker (User: laurie)");
+    // Subscribe to all vehicle payment requests
+    // Topic format: matatu/{plateNumber}/pay
+    mqttClient.subscribe('matatu/+/pay'); 
+});
+
+// 3. Message Handler (The Core Logic)
+mqttClient.on('message', async (topic, message) => {
+    try {
+        // Parse Topic & Payload
+        // Topic: matatu/KCD123A/pay
+        const plateNumber = topic.split('/')[1]; 
+        const data = JSON.parse(message.toString()); // Expects: { "tagUid": "xx", "amount": 50 }
+        
+        console.log(`📡 Payment Request from ${plateNumber}:`, data);
+
+        // A. Find the Tag & User
+        const tag = await Tag.findOne({ 
+            where: { tagUid: data.tagUid },
+            include: User 
+        });
+
+        if (!tag || !tag.User) {
+            console.log("❌ Unknown Tag");
+            mqttClient.publish(`matatu/${plateNumber}/alert`, JSON.stringify({ status: "ERROR", msg: "Invalid Card" }));
+            return;
+        }
+
+        const user = tag.User;
+
+        // B. Check Balance
+        if (user.balance < data.amount) {
+            console.log("❌ Insufficient Funds");
+            mqttClient.publish(`matatu/${plateNumber}/alert`, JSON.stringify({ status: "FAIL", msg: "Low Balance" }));
+            // Optional: Trigger STK Push here automatically?
+            return;
+        }
+
+        // C. Process Payment (Atomic Transaction)
+        await sequelize.transaction(async (t) => {
+            await user.decrement('balance', { by: data.amount, transaction: t });
+            await Transaction.create({
+                UserId: user.id,
+                type: 'FARE_PAYMENT',
+                amount: -data.amount,
+                reference: plateNumber,
+                description: `Fare for ${plateNumber}`
+            }, { transaction: t });
+        });
+
+        // D. Reply to Hardware (Unlock Turnstile / Print Ticket)
+        console.log(`✅ Payment Approved: Ksh ${data.amount} from ${user.name}`);
+        mqttClient.publish(`matatu/${plateNumber}/alert`, JSON.stringify({ 
+            status: "SUCCESS", 
+            msg: "Paid", 
+            bal: user.balance - data.amount 
+        }));
+
+    } catch (err) {
+        console.error("MQTT Error:", err.message);
+    }
+});
 // --- API ROUTES ---
 
 // 1. Authentication
