@@ -5,6 +5,7 @@ const cors = require('cors');
 const { Sequelize, DataTypes } = require('sequelize');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
+const mqtt = require('mqtt');
 
 // --- APP CONFIGURATION ---
 const app = express();
