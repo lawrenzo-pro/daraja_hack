@@ -243,4 +243,68 @@ app.post('/auth/login', async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
+app.get('/wallet/balance', authenticate, async (req, res) => {
+    try {
+        const user = await User.findByPk(req.user.id);
+        res.json({ balance: user.balance, name: user.name });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 2. Get Registered Tags
+app.get('/tags', authenticate, async (req, res) => {
+    try {
+        const tags = await Tag.findAll({ where: { UserId: req.user.id } });
+        res.json(tags);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 3. Transfer Tokens to Another User
+app.post('/wallet/transfer', authenticate, async (req, res) => {
+    const t = await sequelize.transaction();
+    try {
+        const { recipientPhone, amount } = req.body;
+        const val = parseFloat(amount);
+        const senderId = req.user.id;
+
+        if (isNaN(val) || val <= 0) throw new Error("Invalid amount");
+
+        // Validate Sender
+        const sender = await User.findByPk(senderId);
+        if (sender.balance < val) throw new Error("Insufficient Balance");
+
+        // Validate Recipient
+        const formattedRecipientPhone = formatPhone(recipientPhone);
+        if (formattedRecipientPhone === sender.phone) throw new Error("Cannot transfer to self");
+        
+        const recipient = await User.findOne({ where: { phone: formattedRecipientPhone } });
+        if (!recipient) throw new Error("Recipient not found");
+
+        // Execute Atomic Transfer
+        await sender.decrement('balance', { by: val, transaction: t });
+        await recipient.increment('balance', { by: val, transaction: t });
+
+        // Log Transactions
+        await Transaction.create({
+            UserId: senderId,
+            type: 'TRANSFER',
+            amount: -val,
+            reference: recipient.phone,
+            description: `Transfer to ${recipient.name}`
+        }, { transaction: t });
+
+        await Transaction.create({
+            UserId: recipient.id,
+            type: 'TRANSFER',
+            amount: val,
+            reference: sender.phone,
+            description: `Received from ${sender.name}`
+        }, { transaction: t });
+
+        await t.commit();
+        res.json({ message: "Transfer successful", newBalance: sender.balance - val });
+    } catch (err) {
+        await t.rollback();
+        res.status(400).json({ error: err.message });
+    }
+});
 app.listen(3000, () => console.log("🚀 Server Running"));
