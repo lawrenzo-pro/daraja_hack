@@ -23,7 +23,7 @@ const sequelize = new Sequelize({
 // --- MODELS ---
 const User = sequelize.define('User', {
     name: { type: DataTypes.STRING, allowNull: false },
-    phone: { type: DataTypes.STRING, unique: true, allowNull: false }, // Format: 2547...
+    phone: { type: DataTypes.STRING, unique: true, allowNull: false }, // Stored as 2547...
     pinHash: { type: DataTypes.STRING, allowNull: false },
     balance: { type: DataTypes.FLOAT, defaultValue: 0.0 },
 });
@@ -34,7 +34,7 @@ const Tag = sequelize.define('Tag', {
 });
 
 const Transaction = sequelize.define('Transaction', {
-    type: { type: DataTypes.ENUM('DEPOSIT', 'FARE_PAYMENT') },
+    type: { type: DataTypes.ENUM('DEPOSIT', 'FARE_PAYMENT', 'TRANSFER') },
     amount: { type: DataTypes.FLOAT },
     reference: { type: DataTypes.STRING },
     description: { type: DataTypes.STRING }
@@ -47,12 +47,20 @@ User.hasMany(Transaction); Transaction.belongsTo(User);
 (async () => { await sequelize.sync(); console.log("✅ DB Synced"); })();
 
 // ============================================================
-// 🛠️ HELPER FUNCTIONS (Standalone)
+// 🛠️ HELPER FUNCTIONS
 // ============================================================
 
 const getTimestamp = () => new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14);
 
-// 1. Internal Token Generator (No Express Req/Res)
+// Force phone to 2547... format (Removes + and leading 0)
+const formatPhone = (phone) => {
+    let p = phone.toString().replace(/\s+/g, ''); // Remove spaces
+    if (p.startsWith('+')) p = p.slice(1); // Remove +
+    if (p.startsWith('0')) p = '254' + p.slice(1); // 07... -> 2547...
+    return p;
+};
+
+// 1. Internal Token Generator
 const generateTokenInternal = async () => {
     const key = process.env.MPESA_CONSUMER_KEY;
     const secret = process.env.MPESA_CONSUMER_SECRET;
@@ -64,20 +72,8 @@ const generateTokenInternal = async () => {
     const response = await axios.get(url, { headers: { Authorization: `Basic ${auth}` } });
     return response.data.access_token;
 };
-// --- MIDDLEWARE ---
-const authenticate = (req, res, next) => {
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
-    if (!token) return res.status(401).json({ error: "Access Denied" });
 
-    jwt.verify(token, SECRET_KEY, (err, user) => {
-        if (err) return res.status(403).json({ error: "Invalid Token" });
-        req.user = user;
-        next();
-    });
-};
-
-// 2. Standalone STK Push Function
+// 2. Standalone STK Push
 const triggerStkPush = async (phone, amount, accountRef = "AutoTopUp") => {
     try {
         const token = await generateTokenInternal();
@@ -92,13 +88,13 @@ const triggerStkPush = async (phone, amount, accountRef = "AutoTopUp") => {
             "Password": password,
             "Timestamp": timestamp,
             "TransactionType": "CustomerPayBillOnline",
-            "Amount": Math.ceil(amount), // Ensure whole numbers
-            "PartyA": phone,
+            "Amount": Math.ceil(amount),
+            "PartyA": formatPhone(phone), // Ensure format is correct
             "PartyB": shortCode,
-            "PhoneNumber": phone,
+            "PhoneNumber": formatPhone(phone),
             "CallBackURL": callbackUrl,
             "AccountReference": accountRef,
-            "TransactionDesc": "Low Balance Topup"
+            "TransactionDesc": "Topup"
         };
 
         const stkUrl = process.env.MPESA_ENV === 'production' 
@@ -106,7 +102,7 @@ const triggerStkPush = async (phone, amount, accountRef = "AutoTopUp") => {
             : 'https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest';
 
         await axios.post(stkUrl, payload, { headers: { Authorization: `Bearer ${token}` } });
-        console.log(`📲 STK Push sent to ${phone} for Ksh ${amount}`);
+        console.log(`📲 STK Push sent to ${phone}`);
         return true;
     } catch (error) {
         console.error("❌ STK Push Error:", error.response ? error.response.data : error.message);
@@ -115,7 +111,7 @@ const triggerStkPush = async (phone, amount, accountRef = "AutoTopUp") => {
 };
 
 // ============================================================
-// 🚀 MQTT LOGIC (The Updated Part)
+// 🚀 MQTT LOGIC
 // ============================================================
 
 const mqttClient = mqtt.connect('mqtt://localhost', {
@@ -132,11 +128,10 @@ mqttClient.on('connect', () => {
 mqttClient.on('message', async (topic, message) => {
     try {
         const plateNumber = topic.split('/')[1];
-        const data = JSON.parse(message.toString()); // { "tagUid": "...", "amount": 50 }
+        const data = JSON.parse(message.toString()); 
         
         console.log(`📡 Scan from ${plateNumber}:`, data);
 
-        // 1. Find User
         const tag = await Tag.findOne({ where: { tagUid: data.tagUid }, include: User });
 
         if (!tag || !tag.User) {
@@ -146,16 +141,12 @@ mqttClient.on('message', async (topic, message) => {
 
         const user = tag.User;
 
-        // 2. Check Balance
         if (user.balance < data.amount) {
-            console.log(`⚠️ Low Balance (${user.balance}). Fare is ${data.amount}. Triggering STK...`);
+            console.log(`⚠️ Low Balance (${user.balance}). Triggering STK...`);
             
-            // --- NEW LOGIC: AUTO STK PUSH ---
-            // We ask for the EXACT fare amount so they can pay immediately
             const sent = await triggerStkPush(user.phone, data.amount, plateNumber);
 
             if (sent) {
-                // Tell Matatu Screen to notify user
                 mqttClient.publish(`matatu/${plateNumber}/alert`, JSON.stringify({ 
                     status: "INFO", 
                     msg: "Check Phone PIN", 
@@ -170,7 +161,7 @@ mqttClient.on('message', async (topic, message) => {
             return;
         }
 
-        // 3. Process Successful Payment
+        // Atomic Transaction
         await sequelize.transaction(async (t) => {
             await user.decrement('balance', { by: data.amount, transaction: t });
             await Transaction.create({
@@ -181,12 +172,14 @@ mqttClient.on('message', async (topic, message) => {
                 description: `Fare`
             }, { transaction: t });
         });
+        
+        await user.reload(); // Refresh balance
 
-        console.log(`✅ Paid Ksh ${data.amount}`);
+        console.log(`✅ Paid Ksh ${data.amount}. New Bal: ${user.balance}`);
         mqttClient.publish(`matatu/${plateNumber}/alert`, JSON.stringify({ 
             status: "SUCCESS", 
             msg: "Paid", 
-            bal: user.balance - data.amount 
+            bal: user.balance
         }));
 
     } catch (err) {
@@ -195,66 +188,22 @@ mqttClient.on('message', async (topic, message) => {
 });
 
 // ============================================================
-// 🌐 EXPRESS ROUTES (Callbacks & Auth)
+// 🌐 EXPRESS ROUTES
 // ============================================================
 
-// M-Pesa Callback (Funds the wallet)
-app.post('/hooks/mpesa', async (req, res) => {
-    try {
-        const data = req.body.Body.stkCallback;
-        if (data.ResultCode !== 0) return res.json({ ResultCode: 0 });
+const authenticate = (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (!token) return res.status(401).json({ error: "Access Denied" });
 
-        const amount = data.CallbackMetadata.Item.find(o => o.Name === 'Amount').Value;
-        const phone = data.CallbackMetadata.Item.find(o => o.Name === 'PhoneNumber').Value.toString();
+    jwt.verify(token, SECRET_KEY, (err, user) => {
+        if (err) return res.status(403).json({ error: "Invalid Token" });
+        req.user = user;
+        next();
+    });
+};
 
-        const user = await User.findOne({ where: { phone } });
-        if (user) {
-            await user.increment('balance', { by: amount });
-            await Transaction.create({ UserId: user.id, type: 'DEPOSIT', amount: amount, reference: "Auto-MPesa", description: "Deposit" });
-            console.log(`💰 Wallet Funded: ${amount}`);
-        }
-        res.json({ ResultCode: 0 });
-    } catch (err) { res.json({ ResultCode: 0 }); }
-});
-
-// Simple Signup to test
-app.post('/auth/signup', async (req, res) => {
-    try {
-        const { name, phone, pin } = req.body;
-        const pinHash = await bcrypt.hash(pin, 10);
-        // Ensure phone is stored as 2547...
-        const formattedPhone = phone.startsWith('0') ? '254' + phone.slice(1) : phone;
-        const user = await User.create({ name, phone: formattedPhone, pinHash });
-        res.json({ userId: user.id });
-    } catch (e) { res.status(400).json({ error: e.message }); }
-});
-
-// Enroll Tag
-app.post('/tags/enroll', async (req, res) => {
-    try {
-        await Tag.create({ tagUid: req.body.tagUid, UserId: req.body.userId });
-        res.json({ msg: "Enrolled" });
-    } catch (e) { res.status(400).json({ error: e.message }); }
-});
-app.post('/auth/login', async (req, res) => {
-    try {
-        const { phone, pin } = req.body;
-        // Format incoming phone to match DB format (254...)
-        const formattedPhone = phone.startsWith('0') ? '254' + phone.slice(1) : phone;
-
-        const user = await User.findOne({ where: { phone: formattedPhone } });
-        
-        if (!user || !(await bcrypt.compare(pin, user.pinHash))) {
-            return res.status(401).json({ error: "Invalid Phone or PIN" });
-        }
-
-        // Generate Token
-        const token = jwt.sign({ id: user.id, phone: user.phone }, SECRET_KEY, { expiresIn: '30d' });
-        res.json({ message: "Login successful", token, user: { name: user.name, balance: user.balance } });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
+// Get Balance
 app.get('/wallet/balance', authenticate, async (req, res) => {
     try {
         const user = await User.findByPk(req.user.id);
@@ -262,7 +211,7 @@ app.get('/wallet/balance', authenticate, async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 2. Get Registered Tags
+// Get Tags
 app.get('/tags', authenticate, async (req, res) => {
     try {
         const tags = await Tag.findAll({ where: { UserId: req.user.id } });
@@ -270,7 +219,15 @@ app.get('/tags', authenticate, async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 3. Transfer Tokens to Another User
+// Enroll Tag
+app.post('/tags/enroll', authenticate, async (req, res) => {
+    try {
+        await Tag.create({ tagUid: req.body.tagUid, UserId: req.user.id });
+        res.json({ msg: "Enrolled" });
+    } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// Transfer Tokens
 app.post('/wallet/transfer', authenticate, async (req, res) => {
     const t = await sequelize.transaction();
     try {
@@ -280,37 +237,20 @@ app.post('/wallet/transfer', authenticate, async (req, res) => {
 
         if (isNaN(val) || val <= 0) throw new Error("Invalid amount");
 
-        // Validate Sender
         const sender = await User.findByPk(senderId);
         if (sender.balance < val) throw new Error("Insufficient Balance");
 
-        // Validate Recipient
         const formattedRecipientPhone = formatPhone(recipientPhone);
         if (formattedRecipientPhone === sender.phone) throw new Error("Cannot transfer to self");
         
         const recipient = await User.findOne({ where: { phone: formattedRecipientPhone } });
         if (!recipient) throw new Error("Recipient not found");
 
-        // Execute Atomic Transfer
         await sender.decrement('balance', { by: val, transaction: t });
         await recipient.increment('balance', { by: val, transaction: t });
 
-        // Log Transactions
-        await Transaction.create({
-            UserId: senderId,
-            type: 'TRANSFER',
-            amount: -val,
-            reference: recipient.phone,
-            description: `Transfer to ${recipient.name}`
-        }, { transaction: t });
-
-        await Transaction.create({
-            UserId: recipient.id,
-            type: 'TRANSFER',
-            amount: val,
-            reference: sender.phone,
-            description: `Received from ${sender.name}`
-        }, { transaction: t });
+        await Transaction.create({ UserId: senderId, type: 'TRANSFER', amount: -val, reference: recipient.phone, description: `Transfer to ${recipient.name}` }, { transaction: t });
+        await Transaction.create({ UserId: recipient.id, type: 'TRANSFER', amount: val, reference: sender.phone, description: `Received from ${sender.name}` }, { transaction: t });
 
         await t.commit();
         res.json({ message: "Transfer successful", newBalance: sender.balance - val });
@@ -319,18 +259,75 @@ app.post('/wallet/transfer', authenticate, async (req, res) => {
         res.status(400).json({ error: err.message });
     }
 });
-// Add this to your server.js
-app.post('/wallet/deposit', authenticate, async (req, res) => {
-    const { amount } = req.body;
-    const phone = req.user.phone; 
-    
-    // Use the existing standalone helper
-    const success = await triggerStkPush(phone, amount, "Ma3PayTopUp");
-    
-    if (success) {
-        res.json({ message: "STK Push Sent" });
-    } else {
-        res.status(500).json({ error: "Failed to initiate M-Pesa transaction" });
+
+// Signup
+app.post('/auth/signup', async (req, res) => {
+    try {
+        const { name, phone, pin } = req.body;
+        const pinHash = await bcrypt.hash(pin, 10);
+        const user = await User.create({ name, phone: formatPhone(phone), pinHash });
+        res.json({ userId: user.id });
+    } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// Login
+app.post('/auth/login', async (req, res) => {
+    try {
+        const { phone, pin } = req.body;
+        const user = await User.findOne({ where: { phone: formatPhone(phone) } });
+        if (!user || !(await bcrypt.compare(pin, user.pinHash))) {
+            return res.status(401).json({ error: "Invalid Phone or PIN" });
+        }
+        const token = jwt.sign({ id: user.id, phone: user.phone }, SECRET_KEY, { expiresIn: '30d' });
+        res.json({ message: "Login successful", token, user: { name: user.name, balance: user.balance } });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// --- M-PESA CALLBACK (CRITICAL FIX) ---
+app.post('/hooks/mpesa', async (req, res) => {
+    console.log("📥 M-Pesa Callback Received");
+    try {
+        const data = req.body.Body.stkCallback;
+        
+        // 1. Check for Failed/Cancelled transactions
+        if (data.ResultCode !== 0) {
+            console.log("❌ M-Pesa Transaction Failed/Cancelled:", data.ResultDesc);
+            return res.json({ ResultCode: 0 }); // Always return success to Safaricom
+        }
+
+        const amount = data.CallbackMetadata.Item.find(o => o.Name === 'Amount').Value;
+        const rawPhone = data.CallbackMetadata.Item.find(o => o.Name === 'PhoneNumber').Value.toString();
+        const receipt = data.CallbackMetadata.Item.find(o => o.Name === 'MpesaReceiptNumber').Value;
+        
+        // 2. Normalize Phone (Crucial Step)
+        const phone = formatPhone(rawPhone);
+
+        console.log(`Processing Deposit: Ksh ${amount} for ${phone} (Ref: ${receipt})`);
+
+        const user = await User.findOne({ where: { phone } });
+        
+        if (user) {
+            // 3. Update Balance
+            await user.increment('balance', { by: amount });
+            await Transaction.create({ 
+                UserId: user.id, 
+                type: 'DEPOSIT', 
+                amount: amount, 
+                reference: receipt, 
+                description: "M-Pesa Deposit" 
+            });
+            
+            await user.reload(); // Ensure instance is up-to-date
+            console.log(`✅ Wallet Updated! New Balance: ${user.balance}`);
+        } else {
+            console.error(`⚠️ User Not Found! Phone in DB does not match ${phone}`);
+        }
+        
+        res.json({ ResultCode: 0 });
+    } catch (err) { 
+        console.error("Callback Error:", err);
+        res.json({ ResultCode: 0 }); 
     }
 });
+
 app.listen(3000, () => console.log("🚀 Server Running"));
