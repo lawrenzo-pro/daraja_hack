@@ -1,6 +1,8 @@
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
+const cors = require('cors')
+app.use(cors());
 let app =express()
 app.use(express.json())
 const isProduction = process.env.MPESA_ENV === 'production';
@@ -68,7 +70,7 @@ const getTimestamp = () => {
 };
 
 // --- ROUTE: SEND STK PUSH ---
-app.get('/stk-push', getAccessToken, async (req, res) => {
+app.post('/stk-push', getAccessToken, async (req, res) => {
     const phoneNumber = "254790232089" 
     const amount  = "3000"
     
@@ -117,6 +119,7 @@ app.get('/stk-push', getAccessToken, async (req, res) => {
     }
 });
 app.post("/callback", (req,res) => {
+    //magic awaits
     console.log(req.body.Body.stkCallback)
     //console.log(res)
 })
