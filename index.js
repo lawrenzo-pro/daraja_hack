@@ -224,5 +224,23 @@ app.post('/tags/enroll', async (req, res) => {
         res.json({ msg: "Enrolled" });
     } catch (e) { res.status(400).json({ error: e.message }); }
 });
+app.post('/auth/login', async (req, res) => {
+    try {
+        const { phone, pin } = req.body;
+        // Format incoming phone to match DB format (254...)
+        const formattedPhone = phone.startsWith('0') ? '254' + phone.slice(1) : phone;
 
+        const user = await User.findOne({ where: { phone: formattedPhone } });
+        
+        if (!user || !(await bcrypt.compare(pin, user.pinHash))) {
+            return res.status(401).json({ error: "Invalid Phone or PIN" });
+        }
+
+        // Generate Token
+        const token = jwt.sign({ id: user.id, phone: user.phone }, SECRET_KEY, { expiresIn: '30d' });
+        res.json({ message: "Login successful", token, user: { name: user.name, balance: user.balance } });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
 app.listen(3000, () => console.log("🚀 Server Running"));
