@@ -319,4 +319,18 @@ app.post('/wallet/transfer', authenticate, async (req, res) => {
         res.status(400).json({ error: err.message });
     }
 });
+// Add this to your server.js
+app.post('/wallet/deposit', authenticate, async (req, res) => {
+    const { amount } = req.body;
+    const phone = req.user.phone; 
+    
+    // Use the existing standalone helper
+    const success = await triggerStkPush(phone, amount, "Ma3PayTopUp");
+    
+    if (success) {
+        res.json({ message: "STK Push Sent" });
+    } else {
+        res.status(500).json({ error: "Failed to initiate M-Pesa transaction" });
+    }
+});
 app.listen(3000, () => console.log("🚀 Server Running"));
