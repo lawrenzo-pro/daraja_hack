@@ -23,7 +23,7 @@ const sequelize = new Sequelize({
 // --- MODELS ---
 const User = sequelize.define('User', {
     name: { type: DataTypes.STRING, allowNull: false },
-    phone: { type: DataTypes.STRING, unique: true, allowNull: false }, // Stored as 2547...
+    phone: { type: DataTypes.STRING, unique: true, allowNull: false }, 
     pinHash: { type: DataTypes.STRING, allowNull: false },
     balance: { type: DataTypes.FLOAT, defaultValue: 0.0 },
 });
@@ -33,6 +33,20 @@ const Tag = sequelize.define('Tag', {
     status: { type: DataTypes.ENUM('ACTIVE', 'BLOCKED'), defaultValue: 'ACTIVE' }
 });
 
+// Re-added Matatu Model
+const Matatu = sequelize.define('Matatu', {
+    plateNumber: { type: DataTypes.STRING, unique: true },
+    route: { type: DataTypes.STRING }, // e.g., "Eldoret - Langas"
+    sacco: { type: DataTypes.STRING }
+});
+
+// Re-added Review Model
+const Review = sequelize.define('Review', {
+    rating: { type: DataTypes.INTEGER, allowNull: false, validate: { min: 1, max: 5 } },
+    comment: { type: DataTypes.TEXT },
+    tags: { type: DataTypes.STRING } 
+});
+
 const Transaction = sequelize.define('Transaction', {
     type: { type: DataTypes.ENUM('DEPOSIT', 'FARE_PAYMENT', 'TRANSFER') },
     amount: { type: DataTypes.FLOAT },
@@ -40,11 +54,28 @@ const Transaction = sequelize.define('Transaction', {
     description: { type: DataTypes.STRING }
 });
 
-User.hasMany(Tag); Tag.belongsTo(User);
+// --- RELATIONSHIPS ---
+User.hasMany(Tag);        Tag.belongsTo(User);
 User.hasMany(Transaction); Transaction.belongsTo(User);
+User.hasMany(Review);      Review.belongsTo(User);
+Matatu.hasMany(Review);    Review.belongsTo(Matatu);
 
-// Sync DB
-(async () => { await sequelize.sync(); console.log("✅ DB Synced"); })();
+// --- DB INIT ---
+(async () => { 
+    await sequelize.sync({ force: false }); 
+    console.log("✅ DB Synced");
+
+    // Seed Matatus if empty
+    if (await Matatu.count() === 0) {
+        await Matatu.bulkCreate([
+            { plateNumber: "KCD 123A", route: "Eldoret Town - Langas", sacco: "Langas Shuttle" },
+            { plateNumber: "KBK 888T", route: "Eldoret Town - Huruma", sacco: "Huruma Sacco" },
+            { plateNumber: "KDG 456Y", route: "Eldoret Town - Kapsoya", sacco: "Kapsoya Line" },
+            { plateNumber: "KDA 999Z", route: "Eldoret Town - Annex/Moi Uni", sacco: "Eldo-Uni" }
+        ]);
+        console.log("✅ Seeded Matatus");
+    }
+})();
 
 // ============================================================
 // 🛠️ HELPER FUNCTIONS
@@ -52,15 +83,13 @@ User.hasMany(Transaction); Transaction.belongsTo(User);
 
 const getTimestamp = () => new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14);
 
-// Force phone to 2547... format (Removes + and leading 0)
 const formatPhone = (phone) => {
-    let p = phone.toString().replace(/\s+/g, ''); // Remove spaces
-    if (p.startsWith('+')) p = p.slice(1); // Remove +
-    if (p.startsWith('0')) p = '254' + p.slice(1); // 07... -> 2547...
+    let p = phone.toString().replace(/\s+/g, '');
+    if (p.startsWith('+')) p = p.slice(1);
+    if (p.startsWith('0')) p = '254' + p.slice(1);
     return p;
 };
 
-// 1. Internal Token Generator
 const generateTokenInternal = async () => {
     const key = process.env.MPESA_CONSUMER_KEY;
     const secret = process.env.MPESA_CONSUMER_SECRET;
@@ -73,7 +102,6 @@ const generateTokenInternal = async () => {
     return response.data.access_token;
 };
 
-// 2. Standalone STK Push
 const triggerStkPush = async (phone, amount, accountRef = "AutoTopUp") => {
     try {
         const token = await generateTokenInternal();
@@ -89,7 +117,7 @@ const triggerStkPush = async (phone, amount, accountRef = "AutoTopUp") => {
             "Timestamp": timestamp,
             "TransactionType": "CustomerPayBillOnline",
             "Amount": Math.ceil(amount),
-            "PartyA": formatPhone(phone), // Ensure format is correct
+            "PartyA": formatPhone(phone),
             "PartyB": shortCode,
             "PhoneNumber": formatPhone(phone),
             "CallBackURL": callbackUrl,
@@ -129,7 +157,6 @@ mqttClient.on('message', async (topic, message) => {
     try {
         const plateNumber = topic.split('/')[1];
         const data = JSON.parse(message.toString()); 
-        
         console.log(`📡 Scan from ${plateNumber}:`, data);
 
         const tag = await Tag.findOne({ where: { tagUid: data.tagUid }, include: User });
@@ -141,27 +168,20 @@ mqttClient.on('message', async (topic, message) => {
 
         const user = tag.User;
 
+        // Check Balance
         if (user.balance < data.amount) {
-            console.log(`⚠️ Low Balance (${user.balance}). Triggering STK...`);
-            
+            console.log(`⚠️ Low Balance. Triggering STK...`);
             const sent = await triggerStkPush(user.phone, data.amount, plateNumber);
-
-            if (sent) {
-                mqttClient.publish(`matatu/${plateNumber}/alert`, JSON.stringify({ 
-                    status: "INFO", 
-                    msg: "Check Phone PIN", 
-                    bal: user.balance 
-                }));
-            } else {
-                mqttClient.publish(`matatu/${plateNumber}/alert`, JSON.stringify({ 
-                    status: "FAIL", 
-                    msg: "M-Pesa Error" 
-                }));
-            }
+            
+            mqttClient.publish(`matatu/${plateNumber}/alert`, JSON.stringify({ 
+                status: sent ? "INFO" : "FAIL", 
+                msg: sent ? "Check Phone PIN" : "M-Pesa Error", 
+                bal: user.balance 
+            }));
             return;
         }
 
-        // Atomic Transaction
+        // Process Payment
         await sequelize.transaction(async (t) => {
             await user.decrement('balance', { by: data.amount, transaction: t });
             await Transaction.create({
@@ -169,13 +189,13 @@ mqttClient.on('message', async (topic, message) => {
                 type: 'FARE_PAYMENT',
                 amount: -data.amount,
                 reference: plateNumber,
-                description: `Fare`
+                description: `Fare for ${plateNumber}`
             }, { transaction: t });
         });
         
-        await user.reload(); // Refresh balance
-
+        await user.reload(); 
         console.log(`✅ Paid Ksh ${data.amount}. New Bal: ${user.balance}`);
+        
         mqttClient.publish(`matatu/${plateNumber}/alert`, JSON.stringify({ 
             status: "SUCCESS", 
             msg: "Paid", 
@@ -203,7 +223,9 @@ const authenticate = (req, res, next) => {
     });
 };
 
-// Get Balance
+// --- WALLET & USER ENDPOINTS ---
+
+// 1. Get Balance
 app.get('/wallet/balance', authenticate, async (req, res) => {
     try {
         const user = await User.findByPk(req.user.id);
@@ -211,23 +233,31 @@ app.get('/wallet/balance', authenticate, async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Get Tags
-app.get('/tags', authenticate, async (req, res) => {
+// 2. Get Recent Activity (RESTORED)
+app.get('/wallet/activity', authenticate, async (req, res) => {
     try {
-        const tags = await Tag.findAll({ where: { UserId: req.user.id } });
-        res.json(tags);
+        const history = await Transaction.findAll({
+            where: { UserId: req.user.id },
+            order: [['createdAt', 'DESC']],
+            limit: 15
+        });
+        res.json(history);
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Enroll Tag
-app.post('/tags/enroll', authenticate, async (req, res) => {
+// 3. Manual Deposit (RESTORED)
+app.post('/wallet/deposit', authenticate, async (req, res) => {
     try {
-        await Tag.create({ tagUid: req.body.tagUid, UserId: req.user.id });
-        res.json({ msg: "Enrolled" });
-    } catch (e) { res.status(400).json({ error: e.message }); }
+        const { amount } = req.body;
+        if(!amount) return res.status(400).json({ error: "Amount required" });
+
+        const sent = await triggerStkPush(req.user.phone, amount, "AppDeposit");
+        if(sent) res.json({ message: "STK Push Sent" });
+        else res.status(500).json({ error: "Failed to send STK Push" });
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Transfer Tokens
+// 4. Transfer
 app.post('/wallet/transfer', authenticate, async (req, res) => {
     const t = await sequelize.transaction();
     try {
@@ -260,6 +290,59 @@ app.post('/wallet/transfer', authenticate, async (req, res) => {
     }
 });
 
+// --- MATATU & REVIEWS (RESTORED) ---
+
+// 5. Get Matatus
+app.get('/matatus', async (req, res) => {
+    try {
+        const matatus = await Matatu.findAll({
+            include: [{ model: Review, attributes: ['rating'] }]
+        });
+        
+        const data = matatus.map(m => {
+            const json = m.toJSON();
+            const total = json.Reviews.reduce((sum, r) => sum + r.rating, 0);
+            const count = json.Reviews.length;
+            json.averageRating = count > 0 ? (total / count).toFixed(1) : "New";
+            json.reviewCount = count;
+            delete json.Reviews;
+            return json;
+        });
+        res.json(data);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 6. Post Review
+app.post('/matatus/:id/reviews', authenticate, async (req, res) => {
+    try {
+        const { rating, comment, tags } = req.body;
+        await Review.create({
+            UserId: req.user.id,
+            MatatuId: req.params.id,
+            rating, comment, tags
+        });
+        res.json({ message: "Review posted" });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// --- TAGS & AUTH ---
+
+// Get Tags
+app.get('/tags', authenticate, async (req, res) => {
+    try {
+        const tags = await Tag.findAll({ where: { UserId: req.user.id } });
+        res.json(tags);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Enroll Tag
+app.post('/tags/enroll', authenticate, async (req, res) => {
+    try {
+        await Tag.create({ tagUid: req.body.tagUid, UserId: req.user.id });
+        res.json({ msg: "Enrolled" });
+    } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
 // Signup
 app.post('/auth/signup', async (req, res) => {
     try {
@@ -283,31 +366,27 @@ app.post('/auth/login', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// --- M-PESA CALLBACK (CRITICAL FIX) ---
+// --- M-PESA CALLBACK ---
 app.post('/hooks/mpesa', async (req, res) => {
     console.log("📥 M-Pesa Callback Received");
     try {
         const data = req.body.Body.stkCallback;
         
-        // 1. Check for Failed/Cancelled transactions
         if (data.ResultCode !== 0) {
-            console.log("❌ M-Pesa Transaction Failed/Cancelled:", data.ResultDesc);
-            return res.json({ ResultCode: 0 }); // Always return success to Safaricom
+            console.log("❌ M-Pesa Transaction Failed:", data.ResultDesc);
+            return res.json({ ResultCode: 0 });
         }
 
         const amount = data.CallbackMetadata.Item.find(o => o.Name === 'Amount').Value;
         const rawPhone = data.CallbackMetadata.Item.find(o => o.Name === 'PhoneNumber').Value.toString();
         const receipt = data.CallbackMetadata.Item.find(o => o.Name === 'MpesaReceiptNumber').Value;
-        
-        // 2. Normalize Phone (Crucial Step)
         const phone = formatPhone(rawPhone);
 
-        console.log(`Processing Deposit: Ksh ${amount} for ${phone} (Ref: ${receipt})`);
+        console.log(`Processing Deposit: Ksh ${amount} for ${phone}`);
 
         const user = await User.findOne({ where: { phone } });
         
         if (user) {
-            // 3. Update Balance
             await user.increment('balance', { by: amount });
             await Transaction.create({ 
                 UserId: user.id, 
@@ -317,7 +396,7 @@ app.post('/hooks/mpesa', async (req, res) => {
                 description: "M-Pesa Deposit" 
             });
             
-            await user.reload(); // Ensure instance is up-to-date
+            await user.reload(); 
             console.log(`✅ Wallet Updated! New Balance: ${user.balance}`);
         } else {
             console.error(`⚠️ User Not Found! Phone in DB does not match ${phone}`);
