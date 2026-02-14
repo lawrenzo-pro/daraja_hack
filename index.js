@@ -360,8 +360,9 @@ app.post('/hooks/payhero', async (req, res) => {
         const data = req.body && req.body.response ? req.body.response : null;
 
         if (!data || data.ResultCode !== 0) {
-            console.log("❌ Pay Hero Transaction Failed:", data ? data.ResultDesc : 'Missing response');
-            return res.json({ success: true });
+            const errorMessage = data ? data.ResultDesc : 'Missing response';
+            console.log("❌ Pay Hero Transaction Failed:", errorMessage);
+            return res.status(400).json({ success: false, error: errorMessage });
         }
 
         const amount = data.Amount;
@@ -387,12 +388,14 @@ app.post('/hooks/payhero', async (req, res) => {
             console.log(`✅ Wallet Updated! New Balance: ${user.balance}`);
         } else {
             console.error(`⚠️ User Not Found! Phone in DB does not match ${phone}`);
+            return res.status(400).json({ success: false, error: "User not found for this phone number" });
+            
         }
         
         res.json({ success: true });
     } catch (err) { 
         console.error("Callback Error:", err);
-        res.json({ success: true }); 
+        res.status(500).json({ success: false, error: err.message });
     }
 });
 
