@@ -326,6 +326,7 @@ app.get('/tags', authenticate, async (req, res) => {
 app.post('/tags/enroll', authenticate, async (req, res) => {
     try {
         await Tag.create({ tagUid: req.body.tagUid, UserId: req.user.id });
+        console.log(`✅ Tag ${req.body.tagUid} enrolled for user ${req.user.id}`);
         res.json({ msg: "Enrolled" });
     } catch (e) { res.status(400).json({ error: e.message }); }
 });
