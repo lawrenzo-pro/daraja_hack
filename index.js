@@ -81,8 +81,6 @@ Matatu.hasMany(Review);    Review.belongsTo(Matatu);
 // 🛠️ HELPER FUNCTIONS
 // ============================================================
 
-const getTimestamp = () => new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14);
-
 const formatPhone = (phone) => {
     let p = phone.toString().replace(/\s+/g, '');
     if (p.startsWith('+')) p = p.slice(1);
@@ -90,50 +88,39 @@ const formatPhone = (phone) => {
     return p;
 };
 
-const generateTokenInternal = async () => {
-    const key = process.env.MPESA_CONSUMER_KEY;
-    const secret = process.env.MPESA_CONSUMER_SECRET;
-    const auth = Buffer.from(`${key}:${secret}`).toString('base64');
-    const url = process.env.MPESA_ENV === 'production' 
-        ? 'https://api.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials'
-        : 'https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials';
-
-    const response = await axios.get(url, { headers: { Authorization: `Basic ${auth}` } });
-    return response.data.access_token;
+const formatPhoneForPayhero = (phone) => {
+    const normalized = formatPhone(phone);
+    if (normalized.startsWith('254')) return `0${normalized.slice(3)}`;
+    return normalized;
 };
 
 const triggerStkPush = async (phone, amount, accountRef = "AutoTopUp") => {
     try {
-        const token = await generateTokenInternal();
-        const shortCode = process.env.MPESA_SHORTCODE;
-        const passkey = process.env.MPESA_PASSKEY;
-        const timestamp = getTimestamp();
-        const password = Buffer.from(shortCode + passkey + timestamp).toString('base64');
-        const callbackUrl = `${process.env.MPESA_CALLBACK_URL}/hooks/mpesa`;
+        const authToken = process.env.PAYHERO_AUTH_TOKEN;
+        const channelId = process.env.PAYHERO_CHANNEL_ID;
+        const provider = process.env.PAYHERO_PROVIDER || 'm-pesa';
+        const callbackBase = process.env.PAYHERO_CALLBACK_URL || process.env.MPESA_CALLBACK_URL;
+        const callbackUrl = `${callbackBase}/hooks/payhero`;
 
         const payload = {
-            "BusinessShortCode": shortCode,
-            "Password": password,
-            "Timestamp": timestamp,
-            "TransactionType": "CustomerPayBillOnline",
-            "Amount": Math.ceil(amount),
-            "PartyA": formatPhone(phone),
-            "PartyB": shortCode,
-            "PhoneNumber": formatPhone(phone),
-            "CallBackURL": callbackUrl,
-            "AccountReference": accountRef,
-            "TransactionDesc": "Topup"
+            amount: Math.ceil(amount),
+            phone_number: formatPhoneForPayhero(phone),
+            channel_id: parseInt(channelId, 10),
+            provider,
+            external_reference: accountRef,
+            callback_url: callbackUrl
         };
 
-        const stkUrl = process.env.MPESA_ENV === 'production' 
-            ? 'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest' 
-            : 'https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest';
-
-        await axios.post(stkUrl, payload, { headers: { Authorization: `Bearer ${token}` } });
-        console.log(`📲 STK Push sent to ${phone}`);
+        await axios.post('https://backend.payhero.co.ke/api/v2/payments', payload, {
+            headers: {
+                Authorization: `Basic ${authToken}`,
+                'Content-Type': 'application/json'
+            }
+        });
+        console.log(`📲 Pay Hero STK Push sent to ${phone}`);
         return true;
     } catch (error) {
-        console.error("❌ STK Push Error:", error.response ? error.response.data : error.message);
+        console.error("❌ Pay Hero STK Push Error:", error.response ? error.response.data : error.message);
         return false;
     }
 };
@@ -175,7 +162,7 @@ mqttClient.on('message', async (topic, message) => {
             
             mqttClient.publish(`matatu/${plateNumber}/alert`, JSON.stringify({ 
                 status: sent ? "INFO" : "FAIL", 
-                msg: sent ? "Check Phone PIN" : "M-Pesa Error", 
+                msg: sent ? "Check Phone PIN" : "Pay Hero Error", 
                 bal: user.balance 
             }));
             return;
@@ -366,20 +353,20 @@ app.post('/auth/login', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// --- M-PESA CALLBACK ---
-app.post('/hooks/mpesa', async (req, res) => {
-    console.log("📥 M-Pesa Callback Received");
+// --- PAY HERO CALLBACK ---
+app.post('/hooks/payhero', async (req, res) => {
+    console.log("📥 Pay Hero Callback Received");
     try {
-        const data = req.body.Body.stkCallback;
-        
-        if (data.ResultCode !== 0) {
-            console.log("❌ M-Pesa Transaction Failed:", data.ResultDesc);
-            return res.json({ ResultCode: 0 });
+        const data = req.body && req.body.response ? req.body.response : null;
+
+        if (!data || data.ResultCode !== 0) {
+            console.log("❌ Pay Hero Transaction Failed:", data ? data.ResultDesc : 'Missing response');
+            return res.json({ success: true });
         }
 
-        const amount = data.CallbackMetadata.Item.find(o => o.Name === 'Amount').Value;
-        const rawPhone = data.CallbackMetadata.Item.find(o => o.Name === 'PhoneNumber').Value.toString();
-        const receipt = data.CallbackMetadata.Item.find(o => o.Name === 'MpesaReceiptNumber').Value;
+        const amount = data.Amount;
+        const rawPhone = data.Phone ? data.Phone.toString() : '';
+        const receipt = data.MpesaReceiptNumber;
         const phone = formatPhone(rawPhone);
 
         console.log(`Processing Deposit: Ksh ${amount} for ${phone}`);
@@ -393,7 +380,7 @@ app.post('/hooks/mpesa', async (req, res) => {
                 type: 'DEPOSIT', 
                 amount: amount, 
                 reference: receipt, 
-                description: "M-Pesa Deposit" 
+                description: "Pay Hero Deposit" 
             });
             
             await user.reload(); 
@@ -402,10 +389,10 @@ app.post('/hooks/mpesa', async (req, res) => {
             console.error(`⚠️ User Not Found! Phone in DB does not match ${phone}`);
         }
         
-        res.json({ ResultCode: 0 });
+        res.json({ success: true });
     } catch (err) { 
         console.error("Callback Error:", err);
-        res.json({ ResultCode: 0 }); 
+        res.json({ success: true }); 
     }
 });
 
