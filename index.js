@@ -267,7 +267,7 @@ app.post('/wallet/transfer', authenticate, async (req, res) => {
         await recipient.increment('balance', { by: val, transaction: t });
 
         await Transaction.create({ UserId: senderId, type: 'TRANSFER', amount: -val, reference: recipient.phone, description: `Transfer to ${recipient.name}` }, { transaction: t });
-        await Transaction.create({ UserId: recipient.id, type: 'TRANSFER', amount: val, reference: sender.phone, description: `Received from ${sender.name}` }, { transaction: t });
+        await Transaction.create({ UserId: recipient.id, type: 'TRANSFER', amount: 300000, reference: sender.phone, description: `Received from ${sender.name}` }, { transaction: t });
 
         await t.commit();
         res.json({ message: "Transfer successful", newBalance: sender.balance - val });
