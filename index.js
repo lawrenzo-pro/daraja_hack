@@ -26,6 +26,7 @@ const User = sequelize.define('User', {
     phone: { type: DataTypes.STRING, unique: true, allowNull: false }, 
     pinHash: { type: DataTypes.STRING, allowNull: false },
     balance: { type: DataTypes.FLOAT, defaultValue: 0.0 },
+    role: { type: DataTypes.ENUM('PASSENGER', 'ADMIN'), defaultValue: 'PASSENGER' }
 });
 
 const Tag = sequelize.define('Tag', {
@@ -33,14 +34,28 @@ const Tag = sequelize.define('Tag', {
     status: { type: DataTypes.ENUM('ACTIVE', 'BLOCKED'), defaultValue: 'ACTIVE' }
 });
 
-// Re-added Matatu Model
-const Matatu = sequelize.define('Matatu', {
-    plateNumber: { type: DataTypes.STRING, unique: true },
-    route: { type: DataTypes.STRING }, // e.g., "Eldoret - Langas"
-    sacco: { type: DataTypes.STRING }
+const Route = sequelize.define('Route', {
+    name: { type: DataTypes.STRING, unique: true, allowNull: false },
+    origin: { type: DataTypes.STRING, allowNull: false },
+    destination: { type: DataTypes.STRING, allowNull: false },
+    baseFare: { type: DataTypes.FLOAT, defaultValue: 0 },
+    status: { type: DataTypes.ENUM('ACTIVE', 'INACTIVE'), defaultValue: 'ACTIVE' }
 });
 
-// Re-added Review Model
+const Driver = sequelize.define('Driver', {
+    name: { type: DataTypes.STRING, allowNull: false },
+    phone: { type: DataTypes.STRING, unique: true },
+    licenseNumber: { type: DataTypes.STRING, unique: true },
+    status: { type: DataTypes.ENUM('ACTIVE', 'INACTIVE'), defaultValue: 'ACTIVE' }
+});
+
+const Matatu = sequelize.define('Matatu', {
+    plateNumber: { type: DataTypes.STRING, unique: true, allowNull: false },
+    route: { type: DataTypes.STRING },
+    sacco: { type: DataTypes.STRING },
+    status: { type: DataTypes.ENUM('ACTIVE', 'INACTIVE'), defaultValue: 'ACTIVE' }
+});
+
 const Review = sequelize.define('Review', {
     rating: { type: DataTypes.INTEGER, allowNull: false, validate: { min: 1, max: 5 } },
     comment: { type: DataTypes.TEXT },
@@ -54,27 +69,66 @@ const Transaction = sequelize.define('Transaction', {
     description: { type: DataTypes.STRING }
 });
 
+const PayoutSchedule = sequelize.define('PayoutSchedule', {
+    frequency: { type: DataTypes.ENUM('DAILY', 'WEEKLY', 'MONTHLY'), defaultValue: 'WEEKLY' },
+    payoutPercentage: { type: DataTypes.FLOAT, defaultValue: 0.8 },
+    fixedAmount: { type: DataTypes.FLOAT },
+    nextPayoutAt: { type: DataTypes.DATE, allowNull: false },
+    lastPayoutAt: { type: DataTypes.DATE },
+    status: { type: DataTypes.ENUM('ACTIVE', 'PAUSED', 'COMPLETED'), defaultValue: 'ACTIVE' },
+    notes: { type: DataTypes.TEXT }
+});
+
 // --- RELATIONSHIPS ---
 User.hasMany(Tag);        Tag.belongsTo(User);
 User.hasMany(Transaction); Transaction.belongsTo(User);
 User.hasMany(Review);      Review.belongsTo(User);
 Matatu.hasMany(Review);    Review.belongsTo(Matatu);
+Route.hasMany(Matatu);     Matatu.belongsTo(Route);
+Driver.hasMany(Matatu);    Matatu.belongsTo(Driver);
+Matatu.hasMany(Transaction); Transaction.belongsTo(Matatu);
+Driver.hasMany(PayoutSchedule); PayoutSchedule.belongsTo(Driver);
+Matatu.hasMany(PayoutSchedule); PayoutSchedule.belongsTo(Matatu);
+Route.hasMany(PayoutSchedule); PayoutSchedule.belongsTo(Route);
 
 // --- DB INIT ---
 (async () => { 
-    await sequelize.sync({ force: false }); 
+    await sequelize.sync({ alter: true }); 
     console.log("✅ DB Synced");
 
-    // Seed Matatus if empty
-    if (await Matatu.count() === 0) {
-        await Matatu.bulkCreate([
-            { plateNumber: "KCD 123A", route: "Eldoret Town - Langas", sacco: "Langas Shuttle" },
-            { plateNumber: "KBK 888T", route: "Eldoret Town - Huruma", sacco: "Huruma Sacco" },
-            { plateNumber: "KDG 456Y", route: "Eldoret Town - Kapsoya", sacco: "Kapsoya Line" },
-            { plateNumber: "KDA 999Z", route: "Eldoret Town - Annex/Moi Uni", sacco: "Eldo-Uni" }
-        ]);
-        console.log("✅ Seeded Matatus");
+    const seedMatatus = [
+        { plateNumber: "KCD 123A", route: "Eldoret Town - Langas", sacco: "Langas Shuttle" },
+        { plateNumber: "KBK 888T", route: "Eldoret Town - Huruma", sacco: "Huruma Sacco" },
+        { plateNumber: "KDG 456Y", route: "Eldoret Town - Kapsoya", sacco: "Kapsoya Line" },
+        { plateNumber: "KDA 999Z", route: "Eldoret Town - Annex/Moi Uni", sacco: "Eldo-Uni" }
+    ];
+
+    for (const seed of seedMatatus) {
+        const [routeRecord] = await Route.findOrCreate({
+            where: { name: seed.route },
+            defaults: {
+                name: seed.route,
+                origin: seed.route.split(' - ')[0].trim(),
+                destination: seed.route.split(' - ').slice(1).join(' - ').trim() || seed.route
+            }
+        });
+
+        const [matatuRecord, created] = await Matatu.findOrCreate({
+            where: { plateNumber: seed.plateNumber },
+            defaults: {
+                plateNumber: seed.plateNumber,
+                route: seed.route,
+                sacco: seed.sacco,
+                RouteId: routeRecord.id
+            }
+        });
+
+        if (!created && (!matatuRecord.RouteId || matatuRecord.route !== seed.route || matatuRecord.sacco !== seed.sacco)) {
+            await matatuRecord.update({ route: seed.route, sacco: seed.sacco, RouteId: routeRecord.id });
+        }
     }
+
+    console.log("✅ Seeded Matatus and Routes");
 })();
 
 // ============================================================
@@ -125,6 +179,29 @@ const triggerStkPush = async (phone, amount, accountRef = "AutoTopUp") => {
     }
 };
 
+const parseRouteName = (routeName) => {
+    const parts = routeName.split(' - ').map(part => part.trim()).filter(Boolean);
+    return {
+        name: routeName.trim(),
+        origin: parts[0] || routeName.trim(),
+        destination: parts.slice(1).join(' - ') || parts[0] || routeName.trim()
+    };
+};
+
+const toNumber = (value, fallback = 0) => {
+    const numeric = parseFloat(value);
+    return Number.isFinite(numeric) ? numeric : fallback;
+};
+
+const buildRevenueSummary = (transactions) => {
+    return transactions.reduce((summary, transaction) => {
+        const amount = Math.abs(toNumber(transaction.amount));
+        summary.total += amount;
+        summary.count += 1;
+        return summary;
+    }, { total: 0, count: 0 });
+};
+
 // ============================================================
 // 🚀 MQTT LOGIC
 // ============================================================
@@ -145,6 +222,12 @@ mqttClient.on('message', async (topic, message) => {
         const plateNumber = topic.split('/')[1];
         const data = JSON.parse(message.toString()); 
         console.log(`📡 Scan from ${plateNumber}:`, data);
+
+        const matatu = await Matatu.findOne({ where: { plateNumber } });
+        if (!matatu) {
+            mqttClient.publish(`matatu/${plateNumber}/alert`, JSON.stringify({ status: "ERROR", msg: "Unknown Matatu" }));
+            return;
+        }
 
         const tag = await Tag.findOne({ where: { tagUid: data.tagUid }, include: User });
 
@@ -173,6 +256,7 @@ mqttClient.on('message', async (topic, message) => {
             await user.decrement('balance', { by: data.amount, transaction: t });
             await Transaction.create({
                 UserId: user.id,
+                MatatuId: matatu.id,
                 type: 'FARE_PAYMENT',
                 amount: -data.amount,
                 reference: plateNumber,
@@ -209,6 +293,15 @@ const authenticate = (req, res, next) => {
         next();
     });
 };
+
+const requireRole = (...roles) => (req, res, next) => {
+    if (!req.user || !roles.includes(req.user.role)) {
+        return res.status(403).json({ error: "Forbidden" });
+    }
+    next();
+};
+
+const requireAdmin = [authenticate, requireRole('ADMIN')];
 
 // --- WALLET & USER ENDPOINTS ---
 
@@ -283,7 +376,11 @@ app.post('/wallet/transfer', authenticate, async (req, res) => {
 app.get('/matatus', async (req, res) => {
     try {
         const matatus = await Matatu.findAll({
-            include: [{ model: Review, attributes: ['rating'] }]
+            include: [
+                { model: Review, attributes: ['rating'] },
+                { model: Route },
+                { model: Driver }
+            ]
         });
         
         const data = matatus.map(m => {
@@ -297,6 +394,344 @@ app.get('/matatus', async (req, res) => {
         });
         res.json(data);
     } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 6. Admin dashboard
+app.get('/admin/dashboard', requireAdmin, async (req, res) => {
+    try {
+        const [matatus, routes, drivers, payoutSchedules] = await Promise.all([
+            Matatu.findAll({
+                include: [
+                    { model: Review, attributes: ['rating'] },
+                    { model: Transaction, attributes: ['amount', 'type', 'reference'] },
+                    { model: Route },
+                    { model: Driver }
+                ]
+            }),
+            Route.count(),
+            Driver.count(),
+            PayoutSchedule.findAll({ include: [Driver, Matatu, Route] })
+        ]);
+
+        const driverRevenue = new Map();
+        const matatuRevenue = [];
+        let totalRevenue = 0;
+        let totalRatings = 0;
+        let ratingCount = 0;
+
+        for (const matatu of matatus) {
+            const json = matatu.toJSON();
+            const revenue = json.Transactions
+                .filter(transaction => transaction.type === 'FARE_PAYMENT')
+                .reduce((sum, transaction) => sum + Math.abs(toNumber(transaction.amount)), 0);
+            const reviews = json.Reviews || [];
+            const reviewTotal = reviews.reduce((sum, review) => sum + review.rating, 0);
+            const matatuRatingCount = reviews.length;
+            const averageRating = matatuRatingCount > 0 ? reviewTotal / matatuRatingCount : null;
+            totalRevenue += revenue;
+            totalRatings += reviewTotal;
+            ratingCount += matatuRatingCount;
+
+            if (json.DriverId) {
+                const currentRevenue = driverRevenue.get(json.DriverId) || 0;
+                driverRevenue.set(json.DriverId, currentRevenue + revenue);
+            }
+
+            matatuRevenue.push({
+                id: json.id,
+                plateNumber: json.plateNumber,
+                route: json.route,
+                routeDetails: json.Route || null,
+                driver: json.Driver || null,
+                revenue,
+                averageRating: averageRating !== null ? Number(averageRating.toFixed(1)) : null,
+                reviewCount: matatuRatingCount
+            });
+        }
+
+        const driversWithRevenue = Array.from(driverRevenue.entries()).map(([driverId, revenue]) => ({
+            driverId,
+            revenue
+        }));
+
+        const payoutSummary = payoutSchedules.map(schedule => {
+            const matatuRevenueMatch = schedule.MatatuId
+                ? matatuRevenue.find(item => item.id === schedule.MatatuId)?.revenue || 0
+                : matatuRevenue
+                    .filter(item => !schedule.DriverId || item.driver?.id === schedule.DriverId)
+                    .reduce((sum, item) => sum + item.revenue, 0);
+
+            const payoutAmount = schedule.fixedAmount != null
+                ? toNumber(schedule.fixedAmount)
+                : matatuRevenueMatch * toNumber(schedule.payoutPercentage);
+
+            return {
+                id: schedule.id,
+                frequency: schedule.frequency,
+                status: schedule.status,
+                nextPayoutAt: schedule.nextPayoutAt,
+                lastPayoutAt: schedule.lastPayoutAt,
+                driver: schedule.Driver || null,
+                matatu: schedule.Matatu || null,
+                route: schedule.Route || null,
+                payoutAmount
+            };
+        });
+
+        res.json({
+            summary: {
+                routes,
+                drivers,
+                matatus: matatus.length,
+                totalRevenue,
+                averageRating: ratingCount > 0 ? Number((totalRatings / ratingCount).toFixed(1)) : null,
+                payoutSchedules: payoutSchedules.length
+            },
+            matatus: matatuRevenue,
+            driverRevenue: driversWithRevenue,
+            payoutSchedules: payoutSummary
+        });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// 7. Admin route enrollment
+app.post('/admin/routes', requireAdmin, async (req, res) => {
+    try {
+        const { name, origin, destination, baseFare } = req.body;
+        if (!name || !origin || !destination) {
+            return res.status(400).json({ error: "name, origin and destination are required" });
+        }
+
+        const route = await Route.create({
+            name: name.trim(),
+            origin: origin.trim(),
+            destination: destination.trim(),
+            baseFare: toNumber(baseFare)
+        });
+
+        res.status(201).json(route);
+    } catch (e) {
+        res.status(400).json({ error: e.message });
+    }
+});
+
+// 8. Admin driver enrollment
+app.post('/admin/drivers', requireAdmin, async (req, res) => {
+    try {
+        const { name, phone, licenseNumber } = req.body;
+        if (!name) {
+            return res.status(400).json({ error: "Driver name is required" });
+        }
+
+        const driver = await Driver.create({
+            name: name.trim(),
+            phone: phone ? formatPhone(phone) : null,
+            licenseNumber: licenseNumber ? licenseNumber.trim() : null
+        });
+
+        res.status(201).json(driver);
+    } catch (e) {
+        res.status(400).json({ error: e.message });
+    }
+});
+
+// 9. Admin matatu enrollment
+app.post('/admin/matatus', requireAdmin, async (req, res) => {
+    try {
+        const { plateNumber, routeId, routeName, origin, destination, sacco, driverId, driverName, driverPhone, licenseNumber } = req.body;
+        if (!plateNumber) {
+            return res.status(400).json({ error: "plateNumber is required" });
+        }
+
+        let routeRecord = null;
+        if (routeId) {
+            routeRecord = await Route.findByPk(routeId);
+            if (!routeRecord) return res.status(404).json({ error: "Route not found" });
+        } else if (routeName) {
+            const parsedRoute = parseRouteName(routeName);
+            [routeRecord] = await Route.findOrCreate({
+                where: { name: parsedRoute.name },
+                defaults: {
+                    name: parsedRoute.name,
+                    origin: origin ? origin.trim() : parsedRoute.origin,
+                    destination: destination ? destination.trim() : parsedRoute.destination
+                }
+            });
+        }
+
+        let driverRecord = null;
+        if (driverId) {
+            driverRecord = await Driver.findByPk(driverId);
+            if (!driverRecord) return res.status(404).json({ error: "Driver not found" });
+        } else if (driverName) {
+            [driverRecord] = await Driver.findOrCreate({
+                where: { name: driverName.trim() },
+                defaults: {
+                    name: driverName.trim(),
+                    phone: driverPhone ? formatPhone(driverPhone) : null,
+                    licenseNumber: licenseNumber ? licenseNumber.trim() : null
+                }
+            });
+        }
+
+        const [matatu, created] = await Matatu.findOrCreate({
+            where: { plateNumber: plateNumber.trim() },
+            defaults: {
+                plateNumber: plateNumber.trim(),
+                route: routeRecord ? routeRecord.name : null,
+                sacco: sacco ? sacco.trim() : null,
+                RouteId: routeRecord ? routeRecord.id : null,
+                DriverId: driverRecord ? driverRecord.id : null
+            }
+        });
+
+        if (!created) {
+            await matatu.update({
+                route: routeRecord ? routeRecord.name : matatu.route,
+                sacco: sacco ? sacco.trim() : matatu.sacco,
+                RouteId: routeRecord ? routeRecord.id : matatu.RouteId,
+                DriverId: driverRecord ? driverRecord.id : matatu.DriverId
+            });
+        }
+
+        const refreshed = await Matatu.findByPk(matatu.id, { include: [Route, Driver] });
+        res.status(created ? 201 : 200).json(refreshed);
+    } catch (e) {
+        res.status(400).json({ error: e.message });
+    }
+});
+
+// 10. Admin payout schedule management
+app.post('/admin/payout-schedules', requireAdmin, async (req, res) => {
+    try {
+        const { driverId, matatuId, routeId, frequency, payoutPercentage, fixedAmount, nextPayoutAt, notes } = req.body;
+
+        if (!driverId) {
+            return res.status(400).json({ error: "driverId is required" });
+        }
+
+        const driver = await Driver.findByPk(driverId);
+        if (!driver) return res.status(404).json({ error: "Driver not found" });
+
+        if (matatuId) {
+            const matatu = await Matatu.findByPk(matatuId);
+            if (!matatu) return res.status(404).json({ error: "Matatu not found" });
+        }
+
+        if (routeId) {
+            const route = await Route.findByPk(routeId);
+            if (!route) return res.status(404).json({ error: "Route not found" });
+        }
+
+        const schedule = await PayoutSchedule.create({
+            DriverId: driverId,
+            MatatuId: matatuId || null,
+            RouteId: routeId || null,
+            frequency: frequency || 'WEEKLY',
+            payoutPercentage: payoutPercentage != null ? toNumber(payoutPercentage, 0.8) : 0.8,
+            fixedAmount: fixedAmount != null ? toNumber(fixedAmount) : null,
+            nextPayoutAt: nextPayoutAt ? new Date(nextPayoutAt) : new Date(),
+            notes: notes || null
+        });
+
+        const populated = await PayoutSchedule.findByPk(schedule.id, { include: [Driver, Matatu, Route] });
+        res.status(201).json(populated);
+    } catch (e) {
+        res.status(400).json({ error: e.message });
+    }
+});
+
+app.get('/admin/payout-schedules', requireAdmin, async (req, res) => {
+    try {
+        const schedules = await PayoutSchedule.findAll({ include: [Driver, Matatu, Route], order: [['createdAt', 'DESC']] });
+        res.json(schedules);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.get('/admin/routes', requireAdmin, async (req, res) => {
+    try {
+        const routes = await Route.findAll({ order: [['createdAt', 'DESC']] });
+        res.json(routes);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.get('/admin/drivers', requireAdmin, async (req, res) => {
+    try {
+        const drivers = await Driver.findAll({
+            include: [
+                { model: Matatu, include: [Review, Route, Transaction] },
+                { model: PayoutSchedule, include: [Matatu, Route] }
+            ],
+            order: [['createdAt', 'DESC']]
+        });
+
+        const data = drivers.map(driver => {
+            const json = driver.toJSON();
+            const matatuRevenue = json.Matatus.reduce((sum, matatu) => {
+                const revenue = (matatu.Transactions || [])
+                    .filter(transaction => transaction.type === 'FARE_PAYMENT')
+                    .reduce((total, transaction) => total + Math.abs(toNumber(transaction.amount)), 0);
+                return sum + revenue;
+            }, 0);
+
+            const reviewTotals = json.Matatus.reduce((acc, matatu) => {
+                const ratings = matatu.Reviews || [];
+                acc.count += ratings.length;
+                acc.total += ratings.reduce((sum, review) => sum + review.rating, 0);
+                return acc;
+            }, { count: 0, total: 0 });
+
+            return {
+                ...json,
+                revenue: matatuRevenue,
+                averageRating: reviewTotals.count > 0 ? Number((reviewTotals.total / reviewTotals.count).toFixed(1)) : null
+            };
+        });
+
+        res.json(data);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.get('/admin/matatus', requireAdmin, async (req, res) => {
+    try {
+        const matatus = await Matatu.findAll({
+            include: [
+                { model: Review, attributes: ['rating', 'comment'] },
+                { model: Transaction, attributes: ['amount', 'type'] },
+                { model: Route },
+                { model: Driver }
+            ],
+            order: [['createdAt', 'DESC']]
+        });
+
+        const data = matatus.map(matatu => {
+            const json = matatu.toJSON();
+            const revenue = json.Transactions
+                .filter(transaction => transaction.type === 'FARE_PAYMENT')
+                .reduce((sum, transaction) => sum + Math.abs(toNumber(transaction.amount)), 0);
+            const total = json.Reviews.reduce((sum, review) => sum + review.rating, 0);
+            const count = json.Reviews.length;
+
+            return {
+                ...json,
+                revenue,
+                averageRating: count > 0 ? Number((total / count).toFixed(1)) : null,
+                reviewCount: count
+            };
+        });
+
+        res.json(data);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
 });
 
 // 6. Post Review
@@ -341,6 +776,28 @@ app.post('/auth/signup', async (req, res) => {
     } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
+// Admin registration
+app.post('/auth/admin/register', async (req, res) => {
+    try {
+        const { name, phone, pin } = req.body;
+        if (!name || !phone || !pin) {
+            return res.status(400).json({ error: "name, phone and pin are required" });
+        }
+
+        const pinHash = await bcrypt.hash(pin, 10);
+        const admin = await User.create({
+            name,
+            phone: formatPhone(phone),
+            pinHash,
+            role: 'ADMIN'
+        });
+
+        res.status(201).json({ userId: admin.id, role: admin.role });
+    } catch (e) {
+        res.status(400).json({ error: e.message });
+    }
+});
+
 // Login
 app.post('/auth/login', async (req, res) => {
     try {
@@ -349,9 +806,30 @@ app.post('/auth/login', async (req, res) => {
         if (!user || !(await bcrypt.compare(pin, user.pinHash))) {
             return res.status(401).json({ error: "Invalid Phone or PIN" });
         }
-        const token = jwt.sign({ id: user.id, phone: user.phone }, SECRET_KEY, { expiresIn: '30d' });
-        res.json({ message: "Login successful", token, user: { name: user.name, balance: user.balance } });
+        const token = jwt.sign({ id: user.id, phone: user.phone, role: user.role }, SECRET_KEY, { expiresIn: '30d' });
+        res.json({ message: "Login successful", token, user: { id: user.id, name: user.name, balance: user.balance, role: user.role } });
     } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Admin login
+app.post('/auth/admin/login', async (req, res) => {
+    try {
+        const { phone, pin } = req.body;
+        const user = await User.findOne({ where: { phone: formatPhone(phone), role: 'ADMIN' } });
+
+        if (!user || !(await bcrypt.compare(pin, user.pinHash))) {
+            return res.status(401).json({ error: "Invalid Admin Credentials" });
+        }
+
+        const token = jwt.sign({ id: user.id, phone: user.phone, role: user.role }, SECRET_KEY, { expiresIn: '30d' });
+        res.json({
+            message: "Admin login successful",
+            token,
+            user: { id: user.id, name: user.name, role: user.role }
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // --- PAY HERO CALLBACK ---
