@@ -10,7 +10,14 @@ const mqtt = require('mqtt');
 // --- CONFIGURATION ---
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json({
+    verify: (req, res, buf) => {
+        if (req.originalUrl === '/hooks/payhero') {
+            req.rawBody = buf.toString('utf8');
+        }
+    }
+}));
 const SECRET_KEY = process.env.JWT_SECRET || "secret";
 
 // --- DB SETUP ---
@@ -153,7 +160,7 @@ const triggerStkPush = async (phone, amount, accountRef = "AutoTopUp") => {
         const authToken = process.env.PAYHERO_AUTH_TOKEN;
         const channelId = process.env.PAYHERO_CHANNEL_ID;
         const provider = process.env.PAYHERO_PROVIDER || 'm-pesa';
-        const callbackBase = process.env.PAYHERO_CALLBACK_URL || process.env.MPESA_CALLBACK_URL;
+        const callbackBase = (process.env.PAYHERO_CALLBACK_URL || '').replace(/\/+$/, '');
         const callbackUrl = `${callbackBase}/hooks/payhero`;
 
         const payload = {
@@ -171,6 +178,7 @@ const triggerStkPush = async (phone, amount, accountRef = "AutoTopUp") => {
                 'Content-Type': 'application/json'
             }
         });
+        console.log(`📡 Pay Hero callback_url used: ${callbackUrl}`);
         console.log(`📲 Pay Hero STK Push sent to ${phone}`);
         return true;
     } catch (error) {
@@ -200,6 +208,21 @@ const buildRevenueSummary = (transactions) => {
         summary.count += 1;
         return summary;
     }, { total: 0, count: 0 });
+};
+
+const parseWebhookBody = (req) => {
+    if (req.body && Object.keys(req.body).length > 0) return req.body;
+    if (!req.rawBody) return {};
+
+    try {
+        return JSON.parse(req.rawBody);
+    } catch {
+        try {
+            return Object.fromEntries(new URLSearchParams(req.rawBody));
+        } catch {
+            return {};
+        }
+    }
 };
 
 // ============================================================
@@ -832,21 +855,33 @@ app.post('/auth/admin/login', async (req, res) => {
     }
 });
 
+app.get('/hooks/payhero', (req, res) => {
+    res.status(200).json({ ok: true, route: '/hooks/payhero', method: 'GET' });
+});
+
 // --- PAY HERO CALLBACK ---
 app.post('/hooks/payhero', async (req, res) => {
-    console.log("📥 Pay Hero Callback Received");
-    try {
-        const data = req.body && req.body.response ? req.body.response : null;
+    const incomingBody = parseWebhookBody(req);
+    console.log("📥 Pay Hero Callback Received", {
+        method: req.method,
+        contentType: req.headers['content-type'],
+        userAgent: req.headers['user-agent'],
+        bodyPreview: JSON.stringify(incomingBody).slice(0, 300)
+    });
 
-        if (!data || data.ResultCode !== 0) {
-            const errorMessage = data ? data.ResultDesc : 'Missing response';
+    try {
+        const data = incomingBody && incomingBody.response ? incomingBody.response : incomingBody;
+        const resultCode = Number(data?.ResultCode);
+
+        if (!data || Number.isNaN(resultCode) || resultCode !== 0) {
+            const errorMessage = data?.ResultDesc || data?.result_desc || 'Missing or invalid callback payload';
             console.log("❌ Pay Hero Transaction Failed:", errorMessage);
             return res.status(400).json({ success: false, error: errorMessage });
         }
 
-        const amount = data.Amount;
-        const rawPhone = data.Phone ? data.Phone.toString() : '';
-        const receipt = data.MpesaReceiptNumber;
+        const amount = Number(data.Amount || data.amount || 0);
+        const rawPhone = (data.Phone || data.phone_number || data.phone || '').toString();
+        const receipt = data.MpesaReceiptNumber || data.mpesa_receipt_number || data.transaction_reference || 'NO_RECEIPT';
         const phone = formatPhone(rawPhone);
 
         console.log(`Processing Deposit: Ksh ${amount} for ${phone}`);
@@ -876,6 +911,19 @@ app.post('/hooks/payhero', async (req, res) => {
         console.error("Callback Error:", err);
         res.status(500).json({ success: false, error: err.message });
     }
+});
+
+app.use((err, req, res, next) => {
+    if (err && err.type === 'entity.parse.failed') {
+        console.error('❌ JSON Parse Error', {
+            path: req.originalUrl,
+            contentType: req.headers['content-type'],
+            bodyPreview: (err.body || '').toString().slice(0, 300)
+        });
+        return res.status(400).json({ success: false, error: 'Invalid JSON payload' });
+    }
+
+    return next(err);
 });
 
 app.listen(3000, () => console.log("🚀 Server Running"));
