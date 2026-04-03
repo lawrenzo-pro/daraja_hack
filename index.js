@@ -559,7 +559,27 @@ app.post('/admin/routes', requireAdmin, async (req, res) => {
     }
 });
 
-// 8. Admin driver enrollment
+// 8. Admin set route fare
+app.patch('/admin/routes/:id/fare', requireAdmin, async (req, res) => {
+    try {
+        const route = await Route.findByPk(req.params.id);
+        if (!route) {
+            return res.status(404).json({ error: "Route not found" });
+        }
+
+        const fare = toNumber(req.body.baseFare, NaN);
+        if (!Number.isFinite(fare) || fare < 0) {
+            return res.status(400).json({ error: "baseFare must be a non-negative number" });
+        }
+
+        await route.update({ baseFare: fare });
+        res.json({ message: "Route fare updated", route });
+    } catch (e) {
+        res.status(400).json({ error: e.message });
+    }
+});
+
+// 9. Admin driver enrollment
 app.post('/admin/drivers', requireAdmin, async (req, res) => {
     try {
         const { name, phone, licenseNumber } = req.body;
@@ -579,7 +599,7 @@ app.post('/admin/drivers', requireAdmin, async (req, res) => {
     }
 });
 
-// 9. Admin matatu enrollment
+// 10. Admin matatu enrollment
 app.post('/admin/matatus', requireAdmin, async (req, res) => {
     try {
         const { plateNumber, routeId, routeName, origin, destination, sacco, driverId, driverName, driverPhone, licenseNumber } = req.body;
@@ -645,7 +665,7 @@ app.post('/admin/matatus', requireAdmin, async (req, res) => {
     }
 });
 
-// 10. Admin delete matatu
+// 11. Admin delete matatu
 app.delete('/admin/matatus/:id', requireAdmin, async (req, res) => {
     const t = await sequelize.transaction();
     try {
@@ -668,7 +688,7 @@ app.delete('/admin/matatus/:id', requireAdmin, async (req, res) => {
     }
 });
 
-// 11. Admin payout schedule management
+// 12. Admin payout schedule management
 app.post('/admin/payout-schedules', requireAdmin, async (req, res) => {
     try {
         const { driverId, matatuId, routeId, frequency, payoutPercentage, fixedAmount, nextPayoutAt, notes } = req.body;
