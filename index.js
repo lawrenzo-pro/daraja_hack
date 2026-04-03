@@ -438,7 +438,133 @@ app.get('/matatus', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 6. Admin dashboard
+// 6. User app matatu catalog
+app.get('/app/matatus', authenticate, async (req, res) => {
+    try {
+        const matatus = await Matatu.findAll({
+            include: [
+                { model: Review, attributes: ['rating'] },
+                { model: Route, attributes: ['id', 'name', 'origin', 'destination', 'baseFare', 'status'] },
+                { model: Driver, attributes: ['id', 'name', 'phone', 'status'] }
+            ],
+            order: [['createdAt', 'DESC']]
+        });
+
+        const data = matatus.map(matatu => {
+            const json = matatu.toJSON();
+            const total = json.Reviews.reduce((sum, review) => sum + review.rating, 0);
+            const count = json.Reviews.length;
+
+            return {
+                id: json.id,
+                plateNumber: json.plateNumber,
+                sacco: json.sacco,
+                status: json.status,
+                route: json.Route ? {
+                    id: json.Route.id,
+                    name: json.Route.name,
+                    origin: json.Route.origin,
+                    destination: json.Route.destination,
+                    fare: json.Route.baseFare,
+                    status: json.Route.status
+                } : null,
+                driver: json.Driver ? {
+                    id: json.Driver.id,
+                    name: json.Driver.name,
+                    phone: json.Driver.phone,
+                    status: json.Driver.status
+                } : null,
+                averageRating: count > 0 ? Number((total / count).toFixed(1)) : null,
+                reviewCount: count
+            };
+        });
+
+        res.json(data);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// 7. User app drivers catalog
+app.get('/app/drivers', authenticate, async (req, res) => {
+    try {
+        const drivers = await Driver.findAll({
+            include: [{ model: Matatu, attributes: ['id', 'plateNumber', 'status', 'RouteId'] }],
+            order: [['createdAt', 'DESC']]
+        });
+
+        const data = drivers.map(driver => {
+            const json = driver.toJSON();
+            return {
+                id: json.id,
+                name: json.name,
+                phone: json.phone,
+                status: json.status,
+                assignedMatatus: json.Matatus
+            };
+        });
+
+        res.json(data);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// 8. User app route catalog with fare
+app.get('/app/routes', authenticate, async (req, res) => {
+    try {
+        const routes = await Route.findAll({
+            include: [{ model: Matatu, attributes: ['id', 'plateNumber', 'status'] }],
+            order: [['createdAt', 'DESC']]
+        });
+
+        const data = routes.map(route => {
+            const json = route.toJSON();
+            return {
+                id: json.id,
+                name: json.name,
+                origin: json.origin,
+                destination: json.destination,
+                fare: json.baseFare,
+                status: json.status,
+                matatus: json.Matatus
+            };
+        });
+
+        res.json(data);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// 9. User app matatu ratings
+app.get('/app/matatus/:id/ratings', authenticate, async (req, res) => {
+    try {
+        const matatu = await Matatu.findByPk(req.params.id);
+        if (!matatu) {
+            return res.status(404).json({ error: 'Matatu not found' });
+        }
+
+        const reviews = await Review.findAll({
+            where: { MatatuId: matatu.id },
+            include: [{ model: User, attributes: ['id', 'name'] }],
+            order: [['createdAt', 'DESC']]
+        });
+
+        const summary = buildRevenueSummary(reviews.map(review => ({ amount: review.rating })));
+
+        res.json({
+            matatu: { id: matatu.id, plateNumber: matatu.plateNumber },
+            averageRating: summary.count > 0 ? Number((summary.total / summary.count).toFixed(1)) : null,
+            reviewCount: summary.count,
+            ratings: reviews
+        });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// 10. Admin dashboard
 app.get('/admin/dashboard', requireAdmin, async (req, res) => {
     try {
         const [matatus, routes, drivers, payoutSchedules] = await Promise.all([
@@ -579,7 +705,42 @@ app.patch('/admin/routes/:id/fare', requireAdmin, async (req, res) => {
     }
 });
 
-// 9. Admin driver enrollment
+// 9. Admin delete route
+app.delete('/admin/routes/:id', requireAdmin, async (req, res) => {
+    const t = await sequelize.transaction();
+    try {
+        const route = await Route.findByPk(req.params.id, { transaction: t });
+        if (!route) {
+            await t.rollback();
+            return res.status(404).json({ error: "Route not found" });
+        }
+
+        const [matatuCount, payoutCount] = await Promise.all([
+            Matatu.count({ where: { RouteId: route.id }, transaction: t }),
+            PayoutSchedule.count({ where: { RouteId: route.id }, transaction: t })
+        ]);
+
+        if (matatuCount > 0 || payoutCount > 0) {
+            await t.rollback();
+            return res.status(409).json({
+                error: "Route has dependent records",
+                details: {
+                    matatus: matatuCount,
+                    payoutSchedules: payoutCount
+                }
+            });
+        }
+
+        await route.destroy({ transaction: t });
+        await t.commit();
+        res.json({ message: "Route deleted successfully", routeId: Number(req.params.id) });
+    } catch (e) {
+        await t.rollback();
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// 10. Admin driver enrollment
 app.post('/admin/drivers', requireAdmin, async (req, res) => {
     try {
         const { name, phone, licenseNumber } = req.body;
@@ -599,7 +760,7 @@ app.post('/admin/drivers', requireAdmin, async (req, res) => {
     }
 });
 
-// 10. Admin matatu enrollment
+// 11. Admin matatu enrollment
 app.post('/admin/matatus', requireAdmin, async (req, res) => {
     try {
         const { plateNumber, routeId, routeName, origin, destination, sacco, driverId, driverName, driverPhone, licenseNumber } = req.body;
@@ -665,7 +826,7 @@ app.post('/admin/matatus', requireAdmin, async (req, res) => {
     }
 });
 
-// 11. Admin delete matatu
+// 12. Admin delete matatu
 app.delete('/admin/matatus/:id', requireAdmin, async (req, res) => {
     const t = await sequelize.transaction();
     try {
@@ -688,7 +849,7 @@ app.delete('/admin/matatus/:id', requireAdmin, async (req, res) => {
     }
 });
 
-// 12. Admin payout schedule management
+// 13. Admin payout schedule management
 app.post('/admin/payout-schedules', requireAdmin, async (req, res) => {
     try {
         const { driverId, matatuId, routeId, frequency, payoutPercentage, fixedAmount, nextPayoutAt, notes } = req.body;
