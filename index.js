@@ -820,6 +820,7 @@ app.post('/auth/signup', async (req, res) => {
 
 // Admin registration
 app.post('/auth/admin/register', async (req, res) => {
+    console.log("Admin Registration Attempt:", { body: req.body });
     try {
         const { name, phone, pin } = req.body;
         if (!name || !phone || !pin) {
