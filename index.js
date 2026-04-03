@@ -367,6 +367,69 @@ app.get('/wallet/activity', authenticate, async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// 3b. Get ride history
+app.get('/app/rides', authenticate, async (req, res) => {
+    try {
+        const rides = await Transaction.findAll({
+            where: {
+                UserId: req.user.id,
+                type: 'FARE_PAYMENT'
+            },
+            include: [
+                {
+                    model: Matatu,
+                    attributes: ['id', 'plateNumber', 'sacco', 'route', 'status'],
+                    include: [
+                        {
+                            model: Route,
+                            attributes: ['id', 'name', 'origin', 'destination', 'baseFare', 'status']
+                        },
+                        {
+                            model: Driver,
+                            attributes: ['id', 'name', 'phone', 'status']
+                        }
+                    ]
+                }
+            ],
+            order: [['createdAt', 'DESC']]
+        });
+
+        const data = rides.map(ride => {
+            const json = ride.toJSON();
+            return {
+                id: json.id,
+                amount: Math.abs(toNumber(json.amount)),
+                reference: json.reference,
+                description: json.description,
+                date: json.createdAt,
+                matatu: json.Matatu ? {
+                    id: json.Matatu.id,
+                    plateNumber: json.Matatu.plateNumber,
+                    sacco: json.Matatu.sacco,
+                    route: json.Matatu.Route ? {
+                        id: json.Matatu.Route.id,
+                        name: json.Matatu.Route.name,
+                        origin: json.Matatu.Route.origin,
+                        destination: json.Matatu.Route.destination,
+                        fare: json.Matatu.Route.baseFare,
+                        status: json.Matatu.Route.status
+                    } : null,
+                    driver: json.Matatu.Driver ? {
+                        id: json.Matatu.Driver.id,
+                        name: json.Matatu.Driver.name,
+                        phone: json.Matatu.Driver.phone,
+                        status: json.Matatu.Driver.status
+                    } : null
+                } : null
+            };
+        });
+
+        res.json({ count: data.length, rides: data });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
 // 3. Manual Deposit (RESTORED)
 app.post('/wallet/deposit', authenticate, async (req, res) => {
     try {
@@ -760,7 +823,42 @@ app.post('/admin/drivers', requireAdmin, async (req, res) => {
     }
 });
 
-// 11. Admin matatu enrollment
+// 11. Admin delete driver
+app.delete('/admin/drivers/:id', requireAdmin, async (req, res) => {
+    const t = await sequelize.transaction();
+    try {
+        const driver = await Driver.findByPk(req.params.id, { transaction: t });
+        if (!driver) {
+            await t.rollback();
+            return res.status(404).json({ error: "Driver not found" });
+        }
+
+        const [matatuCount, payoutCount] = await Promise.all([
+            Matatu.count({ where: { DriverId: driver.id }, transaction: t }),
+            PayoutSchedule.count({ where: { DriverId: driver.id }, transaction: t })
+        ]);
+
+        if (matatuCount > 0 || payoutCount > 0) {
+            await t.rollback();
+            return res.status(409).json({
+                error: "Driver has dependent records",
+                details: {
+                    matatus: matatuCount,
+                    payoutSchedules: payoutCount
+                }
+            });
+        }
+
+        await driver.destroy({ transaction: t });
+        await t.commit();
+        res.json({ message: "Driver deleted successfully", driverId: Number(req.params.id) });
+    } catch (e) {
+        await t.rollback();
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// 12. Admin matatu enrollment
 app.post('/admin/matatus', requireAdmin, async (req, res) => {
     try {
         const { plateNumber, routeId, routeName, origin, destination, sacco, driverId, driverName, driverPhone, licenseNumber } = req.body;
@@ -826,7 +924,48 @@ app.post('/admin/matatus', requireAdmin, async (req, res) => {
     }
 });
 
-// 12. Admin delete matatu
+// 13. Admin change matatu route association
+app.patch('/admin/matatus/:id/route', requireAdmin, async (req, res) => {
+    try {
+        const matatu = await Matatu.findByPk(req.params.id);
+        if (!matatu) {
+            return res.status(404).json({ error: "Matatu not found" });
+        }
+
+        const { routeId, routeName, origin, destination } = req.body;
+        if (!routeId && !routeName) {
+            return res.status(400).json({ error: "routeId or routeName is required" });
+        }
+
+        let routeRecord = null;
+        if (routeId) {
+            routeRecord = await Route.findByPk(routeId);
+            if (!routeRecord) return res.status(404).json({ error: "Route not found" });
+        } else {
+            const parsedRoute = parseRouteName(routeName);
+            [routeRecord] = await Route.findOrCreate({
+                where: { name: parsedRoute.name },
+                defaults: {
+                    name: parsedRoute.name,
+                    origin: origin ? origin.trim() : parsedRoute.origin,
+                    destination: destination ? destination.trim() : parsedRoute.destination
+                }
+            });
+        }
+
+        await matatu.update({
+            RouteId: routeRecord.id,
+            route: routeRecord.name
+        });
+
+        const refreshed = await Matatu.findByPk(matatu.id, { include: [Route, Driver] });
+        res.json({ message: "Matatu route updated", matatu: refreshed });
+    } catch (e) {
+        res.status(400).json({ error: e.message });
+    }
+});
+
+// 14. Admin delete matatu
 app.delete('/admin/matatus/:id', requireAdmin, async (req, res) => {
     const t = await sequelize.transaction();
     try {
@@ -849,7 +988,7 @@ app.delete('/admin/matatus/:id', requireAdmin, async (req, res) => {
     }
 });
 
-// 13. Admin payout schedule management
+// 15. Admin payout schedule management
 app.post('/admin/payout-schedules', requireAdmin, async (req, res) => {
     try {
         const { driverId, matatuId, routeId, frequency, payoutPercentage, fixedAmount, nextPayoutAt, notes } = req.body;
