@@ -100,8 +100,27 @@ Route.hasMany(PayoutSchedule); PayoutSchedule.belongsTo(Route);
 
 // --- DB INIT ---
 (async () => { 
-    await sequelize.sync({ alter: true }); 
-    console.log("✅ DB Synced");
+    const allowAlterSync = process.env.DB_ALTER_SYNC === 'true';
+
+    try {
+        if (allowAlterSync) {
+            await sequelize.sync({ alter: true });
+            console.log("✅ DB Synced (alter mode)");
+        } else {
+            await sequelize.sync();
+            console.log("✅ DB Synced (safe mode)");
+        }
+    } catch (syncError) {
+        console.error("❌ DB Sync failed in current mode:", syncError.message);
+
+        if (allowAlterSync) {
+            console.log("↩️ Retrying DB sync in safe mode to avoid SQLite FK drop issues...");
+            await sequelize.sync();
+            console.log("✅ DB Synced (safe fallback)");
+        } else {
+            throw syncError;
+        }
+    }
 
     const seedMatatus = [
         { plateNumber: "KCD 123A", route: "Eldoret Town - Langas", sacco: "Langas Shuttle" },
