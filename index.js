@@ -63,6 +63,11 @@ const Matatu = sequelize.define('Matatu', {
     status: { type: DataTypes.ENUM('ACTIVE', 'INACTIVE'), defaultValue: 'ACTIVE' }
 });
 
+const MatatuAdminRecipient = sequelize.define('MatatuAdminRecipient', {
+    MatatuId: { type: DataTypes.INTEGER, allowNull: false, unique: true },
+    adminPhone: { type: DataTypes.STRING, allowNull: false }
+});
+
 const Review = sequelize.define('Review', {
     rating: { type: DataTypes.INTEGER, allowNull: false, validate: { min: 1, max: 5 } },
     comment: { type: DataTypes.TEXT },
@@ -94,6 +99,10 @@ Matatu.hasMany(Review);    Review.belongsTo(Matatu);
 Route.hasMany(Matatu);     Matatu.belongsTo(Route);
 Driver.hasMany(Matatu);    Matatu.belongsTo(Driver);
 Matatu.hasMany(Transaction); Transaction.belongsTo(Matatu);
+Matatu.hasOne(MatatuAdminRecipient, { as: 'RecipientConfig', foreignKey: 'MatatuId' });
+MatatuAdminRecipient.belongsTo(Matatu, { foreignKey: 'MatatuId' });
+User.hasMany(MatatuAdminRecipient, { as: 'ManagedMatatuRecipients', foreignKey: 'adminPhone', sourceKey: 'phone' });
+MatatuAdminRecipient.belongsTo(User, { as: 'AdminUser', foreignKey: 'adminPhone', targetKey: 'phone' });
 Driver.hasMany(PayoutSchedule); PayoutSchedule.belongsTo(Driver);
 Matatu.hasMany(PayoutSchedule); PayoutSchedule.belongsTo(Matatu);
 Route.hasMany(PayoutSchedule); PayoutSchedule.belongsTo(Route);
@@ -279,6 +288,18 @@ mqttClient.on('message', async (topic, message) => {
         }
 
         const user = tag.User;
+        const recipientConfig = await MatatuAdminRecipient.findOne({ where: { MatatuId: matatu.id } });
+        const adminRecipient = recipientConfig
+            ? await User.findOne({ where: { phone: recipientConfig.adminPhone, role: 'ADMIN' } })
+            : null;
+
+        if (!adminRecipient) {
+            mqttClient.publish(`matatu/${plateNumber}/alert`, JSON.stringify({
+                status: "ERROR",
+                msg: "No admin recipient configured"
+            }));
+            return;
+        }
 
         // Check Balance
         if (user.balance < data.amount) {
@@ -296,6 +317,8 @@ mqttClient.on('message', async (topic, message) => {
         // Process Payment
         await sequelize.transaction(async (t) => {
             await user.decrement('balance', { by: data.amount, transaction: t });
+            await adminRecipient.increment('balance', { by: data.amount, transaction: t });
+
             await Transaction.create({
                 UserId: user.id,
                 MatatuId: matatu.id,
@@ -303,6 +326,15 @@ mqttClient.on('message', async (topic, message) => {
                 amount: -data.amount,
                 reference: plateNumber,
                 description: `Fare for ${plateNumber}`
+            }, { transaction: t });
+
+            await Transaction.create({
+                UserId: adminRecipient.id,
+                MatatuId: matatu.id,
+                type: 'TRANSFER',
+                amount: data.amount,
+                reference: plateNumber,
+                description: `Fare received from ${user.name || user.phone}`
             }, { transaction: t });
         });
         
@@ -469,6 +501,102 @@ app.post('/wallet/transfer', authenticate, async (req, res) => {
 
         await t.commit();
         res.json({ message: "Transfer successful", newBalance: sender.balance - val });
+    } catch (err) {
+        await t.rollback();
+        res.status(400).json({ error: err.message });
+    }
+});
+
+// 5. Commuter fare payment by plate number
+app.post('/app/payments/fare', authenticate, async (req, res) => {
+    const t = await sequelize.transaction();
+    try {
+        const { plateNumber, amount } = req.body;
+        if (!plateNumber) {
+            throw new Error("plateNumber is required");
+        }
+
+        const matatu = await Matatu.findOne({
+            where: { plateNumber: plateNumber.trim() },
+            include: [{ model: Route }]
+        });
+
+        if (!matatu) {
+            throw new Error("Matatu not found");
+        }
+
+        const recipientConfig = await MatatuAdminRecipient.findOne({ where: { MatatuId: matatu.id } });
+        if (!recipientConfig) {
+            throw new Error("No admin recipient configured for this matatu");
+        }
+
+        const adminRecipient = await User.findOne({ where: { phone: recipientConfig.adminPhone, role: 'ADMIN' } });
+        if (!adminRecipient) {
+            throw new Error("Configured admin recipient account not found");
+        }
+
+        const payer = await User.findByPk(req.user.id);
+        if (!payer) {
+            throw new Error("User not found");
+        }
+
+        const routeFare = matatu.Route ? toNumber(matatu.Route.baseFare, 0) : 0;
+        const fareToPay = amount != null ? toNumber(amount, NaN) : routeFare;
+        if (!Number.isFinite(fareToPay) || fareToPay <= 0) {
+            throw new Error("A valid fare amount is required");
+        }
+
+        if (payer.balance < fareToPay) {
+            await t.rollback();
+            const sent = await triggerStkPush(payer.phone, fareToPay, matatu.plateNumber);
+            return res.status(400).json({
+                error: "Insufficient balance",
+                message: sent ? "Top-up prompt sent to your phone" : "Top-up could not be initiated",
+                balance: payer.balance,
+                requiredAmount: fareToPay
+            });
+        }
+
+        await payer.decrement('balance', { by: fareToPay, transaction: t });
+        await adminRecipient.increment('balance', { by: fareToPay, transaction: t });
+
+        await Transaction.create({
+            UserId: payer.id,
+            MatatuId: matatu.id,
+            type: 'FARE_PAYMENT',
+            amount: -fareToPay,
+            reference: matatu.plateNumber,
+            description: `Fare for ${matatu.plateNumber}`
+        }, { transaction: t });
+
+        await Transaction.create({
+            UserId: adminRecipient.id,
+            MatatuId: matatu.id,
+            type: 'TRANSFER',
+            amount: fareToPay,
+            reference: matatu.plateNumber,
+            description: `Fare received from ${payer.name || payer.phone}`
+        }, { transaction: t });
+
+        await t.commit();
+
+        const updatedPayer = await User.findByPk(payer.id);
+        const updatedAdmin = await User.findByPk(adminRecipient.id);
+
+        res.json({
+            message: "Fare payment successful",
+            plateNumber: matatu.plateNumber,
+            route: matatu.route,
+            amount: fareToPay,
+            recipient: {
+                adminPhone: adminRecipient.phone,
+                adminName: adminRecipient.name
+            },
+            balances: {
+                payer: updatedPayer ? updatedPayer.balance : null,
+                recipient: updatedAdmin ? updatedAdmin.balance : null
+            }
+        });
     } catch (err) {
         await t.rollback();
         res.status(400).json({ error: err.message });
@@ -861,9 +989,15 @@ app.delete('/admin/drivers/:id', requireAdmin, async (req, res) => {
 // 12. Admin matatu enrollment
 app.post('/admin/matatus', requireAdmin, async (req, res) => {
     try {
-        const { plateNumber, routeId, routeName, origin, destination, sacco, driverId, driverName, driverPhone, licenseNumber } = req.body;
+        const { plateNumber, routeId, routeName, origin, destination, sacco, driverId, driverName, driverPhone, licenseNumber, adminPhone } = req.body;
         if (!plateNumber) {
             return res.status(400).json({ error: "plateNumber is required" });
+        }
+
+        const recipientPhone = formatPhone(adminPhone || req.user.phone);
+        const adminUser = await User.findOne({ where: { phone: recipientPhone, role: 'ADMIN' } });
+        if (!adminUser) {
+            return res.status(404).json({ error: 'Admin recipient account not found' });
         }
 
         let routeRecord = null;
@@ -917,7 +1051,14 @@ app.post('/admin/matatus', requireAdmin, async (req, res) => {
             });
         }
 
-        const refreshed = await Matatu.findByPk(matatu.id, { include: [Route, Driver] });
+        await MatatuAdminRecipient.upsert({
+            MatatuId: matatu.id,
+            adminPhone: adminUser.phone
+        });
+
+        const refreshed = await Matatu.findByPk(matatu.id, {
+            include: [Route, Driver, { model: MatatuAdminRecipient, as: 'RecipientConfig' }]
+        });
         res.status(created ? 201 : 200).json(refreshed);
     } catch (e) {
         res.status(400).json({ error: e.message });
@@ -965,7 +1106,36 @@ app.patch('/admin/matatus/:id/route', requireAdmin, async (req, res) => {
     }
 });
 
-// 14. Admin delete matatu
+// 14. Admin change matatu recipient account
+app.patch('/admin/matatus/:id/recipient', requireAdmin, async (req, res) => {
+    try {
+        const matatu = await Matatu.findByPk(req.params.id);
+        if (!matatu) {
+            return res.status(404).json({ error: "Matatu not found" });
+        }
+
+        const recipientPhone = formatPhone(req.body.adminPhone || req.user.phone);
+        const adminUser = await User.findOne({ where: { phone: recipientPhone, role: 'ADMIN' } });
+        if (!adminUser) {
+            return res.status(404).json({ error: 'Admin recipient account not found' });
+        }
+
+        await MatatuAdminRecipient.upsert({
+            MatatuId: matatu.id,
+            adminPhone: adminUser.phone
+        });
+
+        const refreshed = await Matatu.findByPk(matatu.id, {
+            include: [Route, Driver, { model: MatatuAdminRecipient, as: 'RecipientConfig' }]
+        });
+
+        res.json({ message: 'Matatu recipient updated', matatu: refreshed });
+    } catch (e) {
+        res.status(400).json({ error: e.message });
+    }
+});
+
+// 15. Admin delete matatu
 app.delete('/admin/matatus/:id', requireAdmin, async (req, res) => {
     const t = await sequelize.transaction();
     try {
@@ -978,6 +1148,7 @@ app.delete('/admin/matatus/:id', requireAdmin, async (req, res) => {
         await Review.destroy({ where: { MatatuId: matatu.id }, transaction: t });
         await Transaction.destroy({ where: { MatatuId: matatu.id }, transaction: t });
         await PayoutSchedule.destroy({ where: { MatatuId: matatu.id }, transaction: t });
+        await MatatuAdminRecipient.destroy({ where: { MatatuId: matatu.id }, transaction: t });
         await matatu.destroy({ transaction: t });
 
         await t.commit();
@@ -988,7 +1159,7 @@ app.delete('/admin/matatus/:id', requireAdmin, async (req, res) => {
     }
 });
 
-// 15. Admin payout schedule management
+// 16. Admin payout schedule management
 app.post('/admin/payout-schedules', requireAdmin, async (req, res) => {
     try {
         const { driverId, matatuId, routeId, frequency, payoutPercentage, fixedAmount, nextPayoutAt, notes } = req.body;
