@@ -131,39 +131,6 @@ Route.hasMany(PayoutSchedule); PayoutSchedule.belongsTo(Route);
         }
     }
 
-    const seedMatatus = [
-        { plateNumber: "KCD 123A", route: "Eldoret Town - Langas", sacco: "Langas Shuttle" },
-        { plateNumber: "KBK 888T", route: "Eldoret Town - Huruma", sacco: "Huruma Sacco" },
-        { plateNumber: "KDG 456Y", route: "Eldoret Town - Kapsoya", sacco: "Kapsoya Line" },
-        { plateNumber: "KDA 999Z", route: "Eldoret Town - Annex/Moi Uni", sacco: "Eldo-Uni" }
-    ];
-
-    for (const seed of seedMatatus) {
-        const [routeRecord] = await Route.findOrCreate({
-            where: { name: seed.route },
-            defaults: {
-                name: seed.route,
-                origin: seed.route.split(' - ')[0].trim(),
-                destination: seed.route.split(' - ').slice(1).join(' - ').trim() || seed.route
-            }
-        });
-
-        const [matatuRecord, created] = await Matatu.findOrCreate({
-            where: { plateNumber: seed.plateNumber },
-            defaults: {
-                plateNumber: seed.plateNumber,
-                route: seed.route,
-                sacco: seed.sacco,
-                RouteId: routeRecord.id
-            }
-        });
-
-        if (!created && (!matatuRecord.RouteId || matatuRecord.route !== seed.route || matatuRecord.sacco !== seed.sacco)) {
-            await matatuRecord.update({ route: seed.route, sacco: seed.sacco, RouteId: routeRecord.id });
-        }
-    }
-
-    console.log("✅ Seeded Matatus and Routes");
 })();
 
 // ============================================================
@@ -731,24 +698,65 @@ app.get('/app/routes', authenticate, async (req, res) => {
 // 9. User app matatu ratings
 app.get('/app/matatus/:id/ratings', authenticate, async (req, res) => {
     try {
-        const matatu = await Matatu.findByPk(req.params.id);
+        const matatu = await Matatu.findByPk(req.params.id, {
+            include: [
+                { model: Route, attributes: ['id', 'name', 'origin', 'destination', 'baseFare', 'status'] },
+                { model: Driver, attributes: ['id', 'name', 'phone', 'status'] }
+            ]
+        });
         if (!matatu) {
             return res.status(404).json({ error: 'Matatu not found' });
         }
 
         const reviews = await Review.findAll({
             where: { MatatuId: matatu.id },
-            include: [{ model: User, attributes: ['id', 'name'] }],
+            include: [
+                { model: User, attributes: ['id', 'name'] },
+                {
+                    model: Matatu,
+                    attributes: ['id', 'plateNumber', 'sacco', 'status'],
+                    include: [
+                        { model: Route, attributes: ['id', 'name', 'origin', 'destination', 'baseFare', 'status'] },
+                        { model: Driver, attributes: ['id', 'name', 'phone', 'status'] }
+                    ]
+                }
+            ],
             order: [['createdAt', 'DESC']]
         });
 
         const summary = buildRevenueSummary(reviews.map(review => ({ amount: review.rating })));
+        const ratings = reviews.map(review => {
+            const json = review.toJSON();
+            return {
+                id: json.id,
+                rating: json.rating,
+                comment: json.comment,
+                tags: json.tags,
+                createdAt: json.createdAt,
+                reviewer: json.User,
+                matatu: json.Matatu ? {
+                    id: json.Matatu.id,
+                    plateNumber: json.Matatu.plateNumber,
+                    sacco: json.Matatu.sacco,
+                    status: json.Matatu.status,
+                    route: json.Matatu.Route || null,
+                    driver: json.Matatu.Driver || null
+                } : null
+            };
+        });
 
         res.json({
-            matatu: { id: matatu.id, plateNumber: matatu.plateNumber },
+            matatu: {
+                id: matatu.id,
+                plateNumber: matatu.plateNumber,
+                sacco: matatu.sacco,
+                status: matatu.status,
+                route: matatu.Route || null,
+                driver: matatu.Driver || null
+            },
             averageRating: summary.count > 0 ? Number((summary.total / summary.count).toFixed(1)) : null,
             reviewCount: summary.count,
-            ratings: reviews
+            ratings
         });
     } catch (e) {
         res.status(500).json({ error: e.message });
@@ -1294,12 +1302,27 @@ app.get('/admin/matatus', requireAdmin, async (req, res) => {
 app.post('/matatus/:id/reviews', authenticate, async (req, res) => {
     try {
         const { rating, comment, tags } = req.body;
-        await Review.create({
+        const review = await Review.create({
             UserId: req.user.id,
             MatatuId: req.params.id,
             rating, comment, tags
         });
-        res.json({ message: "Review posted" });
+
+        const reviewWithDetails = await Review.findByPk(review.id, {
+            include: [
+                { model: User, attributes: ['id', 'name'] },
+                {
+                    model: Matatu,
+                    attributes: ['id', 'plateNumber', 'sacco', 'status'],
+                    include: [
+                        { model: Route, attributes: ['id', 'name', 'origin', 'destination', 'baseFare', 'status'] },
+                        { model: Driver, attributes: ['id', 'name', 'phone', 'status'] }
+                    ]
+                }
+            ]
+        });
+
+        res.json({ message: "Review posted", review: reviewWithDetails });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
